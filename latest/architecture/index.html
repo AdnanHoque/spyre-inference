@@ -2391,6 +2391,10 @@ the write can scatter through a slot-major view of it:</p>
 </tr>
 </tbody>
 </table>
+<p>The compiled kernels themselves — the per-sequence page attention, the batched decode
+path, the KV store, and the cache's device layout — live under
+<code>spyre_inference/v1/attention/ops/</code>; the backend module holds the metadata builder and
+the host-side orchestration that calls them.</p>
 <p>Key constraints:</p>
 <ul>
 <li><strong>KV length bucketing</strong>: padded block count on power-of-two buckets from <code>block_size</code>
