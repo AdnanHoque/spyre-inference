@@ -2406,8 +2406,8 @@ the host-side orchestration that calls them.</p>
   <code>block_size</code> is rounded up to the next multiple of 64</li>
 <li><strong>GQA only</strong>: MHA (<code>num_queries_per_kv = 1</code>) currently fails in the Spyre compiler's
   layout-propagation pass; only GQA configurations are exercised today</li>
-<li><strong>Supported</strong>: sliding-window masking and logits soft-capping are both handled;
-  ALiBi slopes are not</li>
+<li><strong>Supported</strong>: sliding-window masking (per layer, so a hybrid stack's full-attention
+  layers stay unwindowed) and logits soft-capping are both handled; ALiBi slopes are not</li>
 </ul>
 <h3 id="encoder-only-attention">Encoder-only attention<a class="headerlink" href="#encoder-only-attention" title="Permanent link">&para;</a></h3>
 <p>Encoder-only (embedding) models take a separate path. For <code>ENCODER</code>/<code>ENCODER_ONLY</code>
