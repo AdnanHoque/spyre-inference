@@ -788,6 +788,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#head-major-kv-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Head-major KV cache
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#encoder-only-attention" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1630,6 +1641,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#head-major-kv-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Head-major KV cache
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#encoder-only-attention" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2045,6 +2067,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#head-major-kv-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Head-major KV cache
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#encoder-only-attention" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2395,6 +2428,20 @@ the write can scatter through a slot-major view of it:</p>
 path, the KV store, and the cache's device layout — live under
 <code>spyre_inference/v1/attention/ops/</code>; the backend module holds the metadata builder and
 the host-side orchestration that calls them.</p>
+<h3 id="head-major-kv-cache">Head-major KV cache<a class="headerlink" href="#head-major-kv-cache" title="Permanent link">&para;</a></h3>
+<p><code>SPYRE_ATTN_KV_LAYOUT=head_major</code> selects a second backend,
+<code>SpyreHeadMajorAttentionBackend</code>, that stores a page as
+<code>[num_blocks, num_kv_heads, block_size, head_size]</code> instead. The page then arrives in the
+shape the matmuls want, so step 4's per-page permute disappears — that is the whole point
+of the layout. It moves the transpose to the write: a token's KV heads are <code>block_size</code>
+rows apart, so step 2 becomes one <code>index_copy_</code> per KV head (<code>kv_write_index</code> publishes
+one index per head) over a source materialized contiguously first, rather than a single
+store of one contiguous run per token.</p>
+<p>Everything above the cache's memory — the metadata builder, the bucketer, the mask tiles,
+warmup recording and dispatch — is shared with the token-major backend. What differs is
+duplicated rather than parameterised: the advertised shape, the allocation
+(<code>head_major_kv_layout</code>), and the three kernels that touch a page. The worker follows the
+layer's impl (<code>allocate_pages</code>) rather than a hardcoded shape, so the two cannot disagree.</p>
 <p>Key constraints:</p>
 <ul>
 <li><strong>KV length bucketing</strong>: padded block count on power-of-two buckets from <code>block_size</code>
