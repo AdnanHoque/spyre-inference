@@ -2395,9 +2395,9 @@ compiled graph (see below).</p>
 </tr>
 <tr>
 <td><code>NewGELU</code></td>
-<td><code>SpyreNewGELU</code></td>
+<td>— (not replaced)</td>
 <td>Spyre</td>
-<td><code>forward_native</code> cubes by multiplication instead of <code>torch.pow(x, 3)</code>, which returns <code>abs(x) ** 4</code> on Spyre (torch-spyre#4009)</td>
+<td>No OOT class: vLLM's own <code>gelu_new</code> is traced into the compiled graph, cube term included — torch-spyre decomposes its <code>torch.pow(x, 3.0)</code> into a chain of <code>mul</code> ops (torch-spyre#4479)</td>
 </tr>
 <tr>
 <td><code>ParallelLMHead</code></td>
