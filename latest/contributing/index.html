@@ -2338,10 +2338,11 @@
 </span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    <span class="s2">"model_quality: product-model output gates vs cached HF references (tests/e2e/test_model_quality.py and the compiled encoder cases in test_encoder_models.py); compiles models from 125M encoders up to 31B decoders, runs in its own CI job"</span><span class="p">,</span>
 </span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>    <span class="s2">"rotary: Spyre RoPE tests (tests/custom_ops/test_rotary_embedding.py, tests/multimodal/test_pixtral.py)"</span><span class="p">,</span>
 </span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>    <span class="s2">"fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)"</span><span class="p">,</span>
-</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>    <span class="s2">"conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)"</span><span class="p">,</span>
-</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>    <span class="s2">"pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)"</span><span class="p">,</span>
-</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a>    <span class="s2">"multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither"</span><span class="p">,</span>
-</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="p">]</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>    <span class="s2">"gsm8k: server-based GSM8K accuracy eval (upstream tests/evals/gsm8k); slow, runs in its own CI job"</span><span class="p">,</span>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>    <span class="s2">"conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)"</span><span class="p">,</span>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a>    <span class="s2">"pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)"</span><span class="p">,</span>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a>    <span class="s2">"multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither"</span><span class="p">,</span>
+</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a><span class="p">]</span>
 </span></code></pre></div>
 <p>Upstream vLLM tests are opt-in: they are cloned and collected only when the <code>-m</code> expression names the <code>upstream</code> marker, or <code>--upstream</code> is passed. A negative mention doesn't count, so <code>-m "not upstream"</code> and <code>-m "attention and not upstream"</code> skip the clone entirely.</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1"># Run only local tests (no vLLM clone)</span>
@@ -2358,13 +2359,21 @@
 </span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a>pytest<span class="w"> </span>--upstream<span class="w"> </span>-m<span class="w"> </span><span class="s2">"attention"</span>
 </span></code></pre></div>
 <h4 id="model-output-quality-gate">Model Output Quality Gate<a class="headerlink" href="#model-output-quality-gate" title="Permanent link">&para;</a></h4>
-<p>The <code>model_quality</code> marker gates the product models on their output: each is loaded
-<strong>compiled</strong> (the platform default) and compared against a CPU HF reference — greedy token
-ids and per-token probabilities for the decoders (<code>tests/e2e/test_model_quality.py</code>),
-cosine similarity for the embedding models and sigmoid scores plus document ranking for
-the cross-encoder rerankers (<code>tests/e2e/test_encoder_models.py</code>).</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>make<span class="w"> </span>test-model-quality<span class="w">              </span><span class="c1"># the whole gate, one card</span>
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>make<span class="w"> </span>test-model-quality-shard-0<span class="w">      </span><span class="c1"># one CI shard (QUALITY_SHARDS=6)</span>
+<p>The quality gate holds the product models to their output, and runs as one suite of two
+kinds of case:</p>
+<ul>
+<li><strong><code>model_quality</code></strong> — each product model is loaded <strong>compiled</strong> (the platform default) and
+  compared against a CPU HF reference: greedy token ids and per-token probabilities for the
+  decoders (<code>tests/e2e/test_model_quality.py</code>), cosine similarity for the embedding models
+  and sigmoid scores plus document ranking for the cross-encoder rerankers
+  (<code>tests/e2e/test_encoder_models.py</code>).</li>
+<li><strong><code>gsm8k</code></strong> — server-based GSM8K accuracy evals (one per config in
+  <code>tests/plugin/spyre_testing_plugin/gsm8k_configs/models-spyre.txt</code>), each starting a vLLM
+  server and running a batched eval. These live in the upstream vLLM tree, so the gate's
+  marker expression pulls the cached checkout in automatically (no <code>--upstream</code> flag).</li>
+</ul>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>make<span class="w"> </span>test-quality<span class="w">              </span><span class="c1"># the whole gate, one card</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>make<span class="w"> </span>test-quality-shard-0<span class="w">      </span><span class="c1"># one CI shard (QUALITY_SHARDS=8)</span>
 </span></code></pre></div>
 <p>CI runs the gate as <code>QUALITY_SHARDS</code> parallel 1-card jobs, weighted by recorded runtime like
 the smoke and attention suites. The slowest single case bounds the useful shard count, so
