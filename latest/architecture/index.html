@@ -2744,19 +2744,21 @@ only has to rebuild the rotation cache at the pre-pad frequencies.</p>
 now implements <code>barrier</code>, <code>broadcast</code>, <code>send</code>/<code>recv</code>, list-form <code>allgather</code>, <code>gather</code>,
 and <code>allreduce</code>; only <code>reduce</code> remains a throw-stub, and torch-spyre's spyreccl
 backend still stubs <code>_allgather_base</code> (so <code>dist.all_gather_into_tensor</code> doesn't work).</p>
-<p><code>SpyreCommunicator</code> therefore only overrides:</p>
+<p><code>SpyreCommunicator</code> therefore overrides:</p>
 <ul>
-<li><strong><code>all_gather</code></strong> — routes CPU tensors through the gloo half of the multi-backend
-  <code>cpu:gloo,spyre:spyreccl</code> group, and uses native list-form <code>dist.all_gather</code> for Spyre
-  tensors (the base class's <code>dist.all_gather_into_tensor</code> path is blocked by the
-  <code>_allgather_base</code> stub).</li>
+<li><strong><code>all_reduce</code></strong> — uses the functional <code>_c10d_functional.all_reduce</code>, which torch-spyre
+  lowers to <code>spyre::all_reduce_async</code> inside a compiled graph and which runs eagerly via
+  <code>libspyre_comms</code> outside one, so one code path serves both modes.</li>
+<li><strong><code>all_gather</code></strong> — inside a compiled graph the functional collective lowers to
+  <code>spyre::all_gather_async</code> and stays on device; eager keeps native list-form
+  <code>dist.all_gather</code>, because the functional entry point (<code>allgather_into_tensor_coalesced</code>)
+  is rejected outside a graph. CPU tensors route through the gloo half of the multi-backend
+  <code>cpu:gloo,spyre:spyreccl</code> group.</li>
 <li><strong><code>reduce_scatter</code></strong> — raises; it is not on the TP forward path.</li>
 </ul>
-<p><code>all_reduce</code> and <code>gather</code> are no longer overridden — they now work natively via
-<code>libspyre_comms</code>. Each remaining fallback is
-tagged <code>REPLACE-WITH-NATIVE</code>; the <code>tests/probes/test_spyre_comms_native_probes.py</code> xfail-strict
-suite is the canonical signal: when a probe flips green, delete the corresponding
-override.</p>
+<p><code>gather</code> is not overridden — it works natively via <code>libspyre_comms</code>. The
+<code>tests/probes/test_spyre_comms_native_probes.py</code> xfail-strict suite is the canonical
+signal: when a probe flips green, delete the corresponding override or workaround.</p>
 <p>The worker (<code>TorchSpyreWorker</code>) inherits directly from vLLM's <code>Worker</code> (gpu_worker), not
 <code>CPUWorker</code> — Spyre needs none of the CPU-specific init (NUMA binding, host-RAM
 profiling). Data parallelism (<code>data_parallel_size &gt; 1</code>) is rejected in
