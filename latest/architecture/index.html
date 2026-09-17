@@ -2364,10 +2364,10 @@ compiled graph (see below).</p>
 </thead>
 <tbody>
 <tr>
-<td><code>RMSNorm</code></td>
-<td><code>SpyreRMSNorm</code></td>
+<td><code>GemmaRMSNorm</code></td>
+<td><code>SpyreGemmaRMSNorm</code></td>
 <td>Spyre</td>
-<td><code>forward_oot</code> runs a <code>torch.compile</code>d <code>forward_native</code> on Spyre since EA propagation (PR #2927) is correct compiled, but broken eager.</td>
+<td>An fp16 body with no dtype promotion. Plain <code>RMSNorm</code> needs no replacement — upstream's fp32 <code>forward_native</code> lowers — but Gemma's trailing fp32 <code>weight</code> multiply does not: a STANDARD <code>[hidden]</code> operand that torch-spyre can neither broadcast against a staggered-EA activation nor de-stagger.</td>
 </tr>
 <tr>
 <td><code>RotaryEmbedding</code>, <code>Llama3RotaryEmbedding</code></td>
@@ -2734,9 +2734,12 @@ device before compile, leaving only an <code>index_select</code> in the graph �
 <code>apply_rotary_pos_emb</code>. Head padding is shared with the native path: the platform widens
 <code>head_dim</code> and the weight passes in <code>head_pad.py</code> pad Q/K interleaved, so this backend
 only has to rebuild the rotation cache at the pre-pad frequencies.</p>
-<p>Because the fusers key on class names, the OOT registry also covers the fused norms
-(<code>SpyreTPAwareRMSNorm</code>, <code>SpyreTPAwareGemmaRMSNorm</code>); otherwise they fall back to
-<code>forward_native</code> and its fp32 promotion.</p>
+<p><code>RMSNorm</code> registers no OOT op: upstream <code>forward_native</code> lowers its fp16→fp32 upcast
+into the compiled graph. <code>GemmaRMSNorm</code> still needs one, because its trailing fp32
+<code>weight</code> multiply hits a torch-spyre gap — a STANDARD <code>[hidden]</code> operand that can
+neither broadcast against nor de-stagger the staggered-EA activation. Because the
+fusers key on class names, the OOT registry covers the fused Gemma norm
+(<code>SpyreTPAwareGemmaRMSNorm</code>) too.</p>
 <h2 id="distributed-tp">Distributed (TP)<a class="headerlink" href="#distributed-tp" title="Permanent link">&para;</a></h2>
 <p><code>TorchSpyrePlatform.get_device_communicator_cls</code> returns <code>SpyreCommunicator</code>, a
 <code>DeviceCommunicatorBase</code> override in
