@@ -2415,7 +2415,7 @@ compiled graph (see below).</p>
 <td><code>GateLinear</code></td>
 <td><code>SpyreGateLinear</code></td>
 <td>Spyre</td>
-<td>Clears <code>out_dtype</code> so MoE router logits stay in the weight dtype. Models ask for fp32 logits for CUDA's top-k, but Spyre cannot restickify fp32 (<code>spyre::ReStickifyOpHBM</code> is unsupported for IEEE_FP32) so the routing softmax's reduction over them does not lower</td>
+<td>Clears <code>out_dtype</code> so MoE router logits stay in the weight dtype because Spyre cannot restickify fp32 (<code>spyre::ReStickifyOpHBM</code> is unsupported for IEEE_FP32). The MoE backend promotes stick-aligned full-softmax reductions to fp32 and returns them to the transport dtype</td>
 </tr>
 </tbody>
 </table>
