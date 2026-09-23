@@ -2417,6 +2417,12 @@ compiled graph (see below).</p>
 <td>Spyre</td>
 <td>Clears <code>out_dtype</code> so MoE router logits stay in the weight dtype because Spyre cannot restickify fp32 (<code>spyre::ReStickifyOpHBM</code> is unsupported for IEEE_FP32). The MoE backend promotes stick-aligned full-softmax reductions to fp32 and returns them to the transport dtype</td>
 </tr>
+<tr>
+<td>FP8 <code>ColumnParallelLinear</code> / fused QKV / <code>MergedColumnParallelLinear</code> / <code>RowParallelLinear</code></td>
+<td><code>SpyreFp8LinearKernel</code></td>
+<td>Spyre</td>
+<td>Checkpoint FP8 is dequanted to CPU fp16 at load so <code>model.to("spyre")</code> is a legal H2D. First Spyre forward eager-quantizes each SuperDSC N-tile to <code>qfp8wt</code> and caches it; later forwards compile <code>quantscalepertokenfp8</code> + <code>qfp8ch</code> + <code>aten._scaled_mm</code>. LM head stays FP16</td>
+</tr>
 </tbody>
 </table>
 <h3 id="transposed-linear-weights">Transposed linear weights<a class="headerlink" href="#transposed-linear-weights" title="Permanent link">&para;</a></h3>
@@ -2434,9 +2440,12 @@ in two overrides:</p>
 </ul>
 <p><code>SpyreUnquantizedLinearMethod</code> uses the base defaults (transpose in place, no padding); the five
 linear subclasses install it in <code>__init__</code>, but only when <code>quant_method</code> is an
-<code>UnquantizedLinearMethod</code>; quantized layers keep their own method and the slower
-<code>F.linear</code> path. This is the pure-PyTorch equivalent of torch-spyre's <code>[1,0]</code> weight
-layout, which only fires for <code>nn.Linear</code> and so misses every vLLM parallel-linear.
+<code>UnquantizedLinearMethod</code>; quantized layers keep their own method. This is the
+pure-PyTorch equivalent of torch-spyre's <code>[1,0]</code> weight layout, which only fires
+for <code>nn.Linear</code> and so misses every vLLM parallel-linear. FP8 checkpoints use
+<code>SpyreFp8LinearKernel</code> (<code>custom_ops/fp8_linear_kernel.py</code>) rather than <code>F.linear</code>:
+load dequants to fp16, the first Spyre forward caches <code>qfp8wt</code> per N-tile, and
+the compiled GEMM is <code>qfp8ch</code> + <code>aten._scaled_mm</code>.
 <code>SpyreUnquantizedLMHeadMethod</code> reuses the same base with <code>WEIGHT_T_ATTR="padded_weight_t"</code> and
 <code>ROW_ALIGN=64*32</code>, so the fast path and the padding/un-pad logic are defined once.</p>
 <p>Fused projections stay fused. <code>SpyreQKVParallelLinear</code> returns the whole <code>[..., q+k+v]</code>
