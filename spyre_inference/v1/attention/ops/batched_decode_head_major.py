@@ -25,7 +25,75 @@ scales with entries rather than bytes -- measured at ~2x the kernel time for 8 k
 
 import torch
 
+from spyre_inference import envs
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
+
+# Read at module scope like the walk-mode flag: a process-wide body choice.
+ENTRY_LOCAL_DECODE = envs.SPYRE_ATTN_ENTRY_LOCAL_DECODE
+
+
+def _entry_local_update(
+    carry,
+    sc,
+    v_page,
+    entries,
+    blocks_per_chunk,
+    num_seqs,
+    num_kv_heads,
+    num_queries_per_kv,
+    block_size,
+    head_size,
+):
+    """One chunk's per-block-slot online-softmax update; state kept across chunks."""
+    sc = torch.clamp(sc, min=torch.finfo(sc.dtype).min)
+    pos_max = torch.amax(sc, dim=-1, keepdim=True)
+    if carry is None:
+        probs = torch.exp(sc - pos_max)
+        return (
+            pos_max,
+            torch.sum(probs, dim=-1, keepdim=True),
+            torch.matmul(
+                probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
+                v_page,
+            ).reshape(
+                blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size
+            ),
+        )
+    tile_max, tile_sum, tile_output = carry
+    rescale = torch.exp(-torch.relu(pos_max - tile_max))
+    new_max = torch.maximum(tile_max, pos_max)
+    probs = torch.exp(sc - new_max)
+    return (
+        new_max,
+        tile_sum * rescale + torch.sum(probs, dim=-1, keepdim=True),
+        tile_output * rescale
+        + torch.matmul(
+            probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
+            v_page,
+        ).reshape(
+            blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size
+        ),
+    )
+
+
+def _merge_entry_local(
+    tile_max,
+    tile_sum,
+    tile_output,
+    num_seqs,
+    blocks_per_chunk,
+    num_kv_heads,
+    num_queries_per_kv,
+    head_size,
+):
+    """The one final merge over the ``blocks_per_chunk`` slots held in the carry."""
+    merged_max = torch.amax(tile_max, dim=0, keepdim=True)
+    weight = torch.exp(tile_max - merged_max)
+    merged_sum = torch.sum(weight * tile_sum, dim=0)
+    merged_out = torch.sum(weight * tile_output, dim=0)
+    return (merged_out / merged_sum).reshape(
+        num_seqs, num_kv_heads * num_queries_per_kv, head_size
+    )
 
 
 def batched_decode_head_major_kernel(
@@ -54,6 +122,8 @@ def batched_decode_head_major_kernel(
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
+    # One chunk is upstream's flat branch; entry-local only pays across >1 chunk.
+    use_entry_local = ENTRY_LOCAL_DECODE and chunk_page_ids.shape[0] // blocks_per_chunk > 1
     q = query.index_select(0, rep_row_ids).reshape(
         entries, num_kv_heads, num_queries_per_kv, head_size
     )
@@ -89,6 +159,22 @@ def batched_decode_head_major_kernel(
             blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, block_size
         )
         sc = sc + mask_rows
+        if use_entry_local:
+            return (
+                _entry_local_update(
+                    carry,
+                    sc,
+                    v_page,
+                    entries,
+                    blocks_per_chunk,
+                    num_seqs,
+                    num_kv_heads,
+                    num_queries_per_kv,
+                    block_size,
+                    head_size,
+                ),
+                None,
+            )
         chunk_max = torch.amax(torch.amax(sc, dim=-1, keepdim=True), dim=0, keepdim=True)
 
         # The running max drives exp(), not the chunk's own: a chunk wholly past a
@@ -110,9 +196,15 @@ def batched_decode_head_major_kernel(
             tile_output * rescale + chunk_out,
         ), None
 
-    state_shape = (1, num_seqs, num_kv_heads, num_queries_per_kv, 1)
+    slots = (
+        (blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv)
+        if use_entry_local
+        else (1, num_seqs, num_kv_heads, num_queries_per_kv)
+    )
+    state_shape = (*slots, 1)
+    out_shape = (*slots, head_size)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
-    (_, tile_sum, tile_output), _ = walk_tiles(
+    carry, _ = walk_tiles(
         chunk_body,
         (chunk_page_ids, mask_by_chunk, k_pages, v_pages, q),
         dims=(0, 0, None, None, None),
@@ -120,13 +212,16 @@ def batched_decode_head_major_kernel(
         init=(
             torch.full(state_shape, float("-inf"), **state_kwargs),
             torch.zeros(state_shape, **state_kwargs),
-            torch.zeros(
-                (1, num_seqs, num_kv_heads, num_queries_per_kv, head_size),
-                **state_kwargs,
-            ),
+            torch.zeros(out_shape, **state_kwargs),
         ),
     )
-    attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
+    if use_entry_local:
+        attn = _merge_entry_local(
+            *carry, num_seqs, blocks_per_chunk, num_kv_heads, num_queries_per_kv, head_size
+        )
+    else:
+        _, tile_sum, tile_output = carry
+        attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
     if out is not None:
         # Offset 0, so torch-spyre#3770 does not apply; rows past the batch are
         # don't-care and kept finite by the builder.

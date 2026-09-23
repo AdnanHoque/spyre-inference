@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
+    SPYRE_ATTN_ENTRY_LOCAL_DECODE: bool = False
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
@@ -79,6 +80,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
     # one loop body. Enabled by default; "0" runs the same bodies under Python loops.
     "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "1"))),
+    # Opt in to the entry-local batched-decode body: a per block-slot running softmax across
+    # chunks, merged once. Applies to batched decode with >=2 chunks only; off by default.
+    "SPYRE_ATTN_ENTRY_LOCAL_DECODE": lambda: bool(
+        int(os.getenv("SPYRE_ATTN_ENTRY_LOCAL_DECODE", "0"))
+    ),
     # Comma-separated kv_len buckets to record, unset uses the default buckets of
     # powers of two from block_size up to max_model_len.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
