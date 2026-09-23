@@ -26,10 +26,12 @@ scales with entries rather than bytes -- measured at ~2x the kernel time for 8 k
 import torch
 
 from spyre_inference import envs
-from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
+from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE, walk_tiles
 
-# Read at module scope like the walk-mode flag: a process-wide body choice.
+# Read at module scope like the walk-mode flag: process-wide choices.
 ENTRY_LOCAL_DECODE = envs.SPYRE_ATTN_ENTRY_LOCAL_DECODE
+# TEMPORARY WORKAROUND (torch-spyre#4603): chunk-major index walked one chunk per trip.
+TEMP_SPLIT_INDEX = envs.SPYRE_ATTN_TEMP_SPLIT_INDEX
 
 
 def _entry_local_update(
@@ -45,20 +47,17 @@ def _entry_local_update(
     head_size,
 ):
     """One chunk's per-block-slot online-softmax update; state kept across chunks."""
+
+    def pv(probs):
+        return torch.matmul(
+            probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size), v_page
+        ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size)
+
     sc = torch.clamp(sc, min=torch.finfo(sc.dtype).min)
     pos_max = torch.amax(sc, dim=-1, keepdim=True)
     if carry is None:
         probs = torch.exp(sc - pos_max)
-        return (
-            pos_max,
-            torch.sum(probs, dim=-1, keepdim=True),
-            torch.matmul(
-                probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
-                v_page,
-            ).reshape(
-                blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size
-            ),
-        )
+        return pos_max, torch.sum(probs, dim=-1, keepdim=True), pv(probs)
     tile_max, tile_sum, tile_output = carry
     rescale = torch.exp(-torch.relu(pos_max - tile_max))
     new_max = torch.maximum(tile_max, pos_max)
@@ -66,13 +65,7 @@ def _entry_local_update(
     return (
         new_max,
         tile_sum * rescale + torch.sum(probs, dim=-1, keepdim=True),
-        tile_output * rescale
-        + torch.matmul(
-            probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
-            v_page,
-        ).reshape(
-            blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size
-        ),
+        tile_output * rescale + pv(probs),
     )
 
 
@@ -81,7 +74,6 @@ def _merge_entry_local(
     tile_sum,
     tile_output,
     num_seqs,
-    blocks_per_chunk,
     num_kv_heads,
     num_queries_per_kv,
     head_size,
@@ -91,9 +83,7 @@ def _merge_entry_local(
     weight = torch.exp(tile_max - merged_max)
     merged_sum = torch.sum(weight * tile_sum, dim=0)
     merged_out = torch.sum(weight * tile_output, dim=0)
-    return (merged_out / merged_sum).reshape(
-        num_seqs, num_kv_heads * num_queries_per_kv, head_size
-    )
+    return (merged_out / merged_sum).reshape(num_seqs, num_kv_heads * num_queries_per_kv, head_size)
 
 
 def batched_decode_head_major_kernel(
@@ -122,8 +112,13 @@ def batched_decode_head_major_kernel(
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
+    # Workaround walk only exists on the tiled path; the Python walk keeps #876's index.
+    split_index = TEMP_SPLIT_INDEX and USE_FOR_EACH_TILE
+    num_chunks = (
+        chunk_page_ids.shape[0] if split_index else chunk_page_ids.shape[0] // blocks_per_chunk
+    )
     # One chunk is upstream's flat branch; entry-local only pays across >1 chunk.
-    use_entry_local = ENTRY_LOCAL_DECODE and chunk_page_ids.shape[0] // blocks_per_chunk > 1
+    use_entry_local = ENTRY_LOCAL_DECODE and num_chunks > 1
     q = query.index_select(0, rep_row_ids).reshape(
         entries, num_kv_heads, num_queries_per_kv, head_size
     )
@@ -143,6 +138,10 @@ def batched_decode_head_major_kernel(
 
     def chunk_body(carry, tiles):
         page_ids, mask_rows, k_pages, v_pages, q = tiles
+        if split_index:
+            # Workaround walk: consume the chunk axis -> [E, 1] pages the gather splits on.
+            page_ids = page_ids[0]
+            mask_rows = mask_rows.reshape(blocks_per_chunk, num_seqs, *mask_rows.shape[3:])
         # Subscripting, not index_select: behind a 1-D index the entry axis splits only in
         # whole 32-entry sticks, and flattening the int32 tile first needs an unsupported
         # staging layout. Costs the eager path, which the preconditions decline.
@@ -208,7 +207,7 @@ def batched_decode_head_major_kernel(
         chunk_body,
         (chunk_page_ids, mask_by_chunk, k_pages, v_pages, q),
         dims=(0, 0, None, None, None),
-        tile_size=blocks_per_chunk,
+        tile_size=1 if split_index else blocks_per_chunk,
         init=(
             torch.full(state_shape, float("-inf"), **state_kwargs),
             torch.zeros(state_shape, **state_kwargs),
@@ -216,8 +215,9 @@ def batched_decode_head_major_kernel(
         ),
     )
     if use_entry_local:
+        tile_max, tile_sum, tile_output = carry
         attn = _merge_entry_local(
-            *carry, num_seqs, blocks_per_chunk, num_kv_heads, num_queries_per_kv, head_size
+            tile_max, tile_sum, tile_output, num_seqs, num_kv_heads, num_queries_per_kv, head_size
         )
     else:
         _, tile_sum, tile_output = carry

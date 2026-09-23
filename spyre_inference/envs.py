@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
     SPYRE_ATTN_ENTRY_LOCAL_DECODE: bool = False
+    SPYRE_ATTN_TEMP_SPLIT_INDEX: bool = False
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
@@ -85,6 +86,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_ATTN_ENTRY_LOCAL_DECODE": lambda: bool(
         int(os.getenv("SPYRE_ATTN_ENTRY_LOCAL_DECODE", "0"))
     ),
+    # TEMPORARY WORKAROUND (torch-spyre#4603): chunk-major page index for the tiled walk.
+    "SPYRE_ATTN_TEMP_SPLIT_INDEX": lambda: bool(int(os.getenv("SPYRE_ATTN_TEMP_SPLIT_INDEX", "0"))),
     # Comma-separated kv_len buckets to record, unset uses the default buckets of
     # powers of two from block_size up to max_model_len.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),

@@ -1258,18 +1258,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self._batched_decode_preconditions_met(attn_metadata)
             and attn_metadata.rep_row_ids_dev is None
         ):
-            assert attn_metadata.rep_row_ids_cpu is not None
-            assert attn_metadata.chunk_page_ids_cpu is not None
-            assert attn_metadata.mask_by_chunk_cpu is not None
-            attn_metadata.rep_row_ids_dev = convert(
-                attn_metadata.rep_row_ids_cpu, device=_target_device
-            )
-            attn_metadata.chunk_page_ids_dev = convert(
-                attn_metadata.chunk_page_ids_cpu, device=_target_device
-            )
-            attn_metadata.mask_by_chunk_dev = convert(
-                attn_metadata.mask_by_chunk_cpu, device=_target_device
-            )
+            self._mirror_batched_decode_indices(attn_metadata, _target_device)
 
         output = self._online_softmax_attention(
             query,
@@ -1632,6 +1621,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         result_flat = result.reshape(b_seqs, num_heads, head_size)
         src_block = result_flat[:num_decode_seqs].clone()
         output[:num_decode_seqs].copy_(src_block)
+
+    def _mirror_batched_decode_indices(
+        self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
+    ) -> None:
+        """Mirror the batched-decode precomputes to ``device`` once per step; overridable."""
+        assert attn_metadata.rep_row_ids_cpu is not None
+        assert attn_metadata.chunk_page_ids_cpu is not None
+        assert attn_metadata.mask_by_chunk_cpu is not None
+        attn_metadata.rep_row_ids_dev = convert(attn_metadata.rep_row_ids_cpu, device=device)
+        attn_metadata.chunk_page_ids_dev = convert(attn_metadata.chunk_page_ids_cpu, device=device)
+        attn_metadata.mask_by_chunk_dev = convert(attn_metadata.mask_by_chunk_cpu, device=device)
 
     def _run_batched_decode(
         self,
