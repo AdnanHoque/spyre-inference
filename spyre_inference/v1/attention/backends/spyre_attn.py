@@ -18,7 +18,7 @@ import contextlib
 import functools
 import time
 from dataclasses import dataclass, field
-from typing import ClassVar, NamedTuple
+from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 import torch
 from torch._dynamo.utils import counters
@@ -58,6 +58,12 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     batched_decode_chunking,
 )
 from spyre_inference.v1.worker import compile_guard
+
+if TYPE_CHECKING:
+    from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+        EncoderGroupPlan,
+        EncoderRectPlan,
+    )
 
 logger = init_logger(__name__)
 
@@ -332,30 +338,10 @@ class SpyreAttentionMetadata(AttentionMetadata):
     mask_by_chunk_cpu: torch.Tensor | None = None
     mask_by_chunk_dev: torch.Tensor | None = None
 
-    # Encoder scatter dest ``[T]`` (int32 on Spyre) and gather unpack.
-    # Filled on the first layer of a step (page_index_tables pattern).
-    encoder_q_pack_idx: torch.Tensor | None = None
-    encoder_kv_pack_idx: torch.Tensor | None = None
-    encoder_unpack_idx: torch.Tensor | None = None
-    # Packed SDPA grid. ``None`` until layer 0; fused B=1 still sets these so
-    # later layers skip rebuild. Do not H2D a ``[B, 1, L, L]`` mask — forward
-    # only needs this pair plus ``encoder_key_pad_mask``.
-    encoder_pack_batch: int | None = None
-    encoder_pack_len: int | None = None
-    encoder_fused_sdpa: bool = False
-    # Host-built key-pad ``[B * KV, 1, 1, L]`` on the target device. ``None`` on
-    # the fused path. Broadcast onto encoder scores ``[BH, G, L, L]`` by the
-    # compiled add in ``_packed_pv``; a dense ``[BH, 1, L, L]`` was needed only
-    # while that add was eager.
-    encoder_key_pad_mask: torch.Tensor | None = None
-    # Slot-major scatter scratch ``[B*L+1, H, D]``. Alloc once per step; ``zero_``
-    # before each pack so pad slots stay empty. K and V must not share a buffer:
-    # at ``Hkv == 1`` ``permute.contiguous`` is a no-op view, so packing V into
-    # K's workspace would silently overwrite ``k_batched``. Q still differs
-    # under GQA.
-    encoder_q_workspace: torch.Tensor | None = None
-    encoder_kv_workspace: torch.Tensor | None = None
-    encoder_v_workspace: torch.Tensor | None = None
+    # Which one it is *is* the path selection: one rectangle for the dense path, a list
+    # of groups for the ragged one. Imported under TYPE_CHECKING only -- the encoder
+    # backend imports from this module, not the other way round.
+    encoder_plan: "EncoderRectPlan | list[EncoderGroupPlan] | None" = None
 
     @property
     def query_lens(self) -> torch.Tensor:

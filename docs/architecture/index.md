@@ -307,42 +307,70 @@ Encoder-only (embedding) models take a separate path. For `ENCODER`/`ENCODER_ONL
 layers, `TorchSpyrePlatform.get_attn_backend_cls` selects `SpyreEncoderAttentionBackend`
 → `SpyreEncoderAttentionImpl` (both subclass the decoder backend/impl in
 `spyre_encoder_attn.py`). This path has **no KV cache** — attention is bidirectional over
-the full sequence — so it skips the paged-cache machinery entirely and instead:
+the full sequence — so it skips the paged-cache machinery. There is no online-softmax
+loop either: a sequence's whole K/V fits one tensor, so nothing forces the block-wise walk
+the decoder needs.
 
-1. Builds the pack **indices** and the additive mask on CPU (Spyre can't produce the bool
-   mask or broadcast the `where`), then scatters ragged Q/K/V into the dense
-   `[num_seqs, H, L, Dp]` batch **on Spyre** with a compiled `index_copy_`. Sequence length
-   `L` padding to the `ENCODER_SEQ_ALIGNMENT = 64` stick is structural (the zero rows of
-   the on-device workspace); head dim `D` is padded to the stick only when it isn't already
-   aligned — a host `F.pad` round-trip for MiniLM's `head_size=32`, a no-op for `D=64`.
-2. Runs the attention **on Spyre**: a fused `F.scaled_dot_product_attention` on the B=1,
-   no-live-pad path, or — on the additive-mask path — a compiled QK matmul, an on-device
-   (eager) mask add, and a compiled P·V. The matmuls are kept separate so Inductor can't
-   fuse them into `F.sdpa`, which drops the additive mask on Spyre.
-3. Unpacks with an on-Spyre `index_select` and writes back with `output.copy_` on Spyre. A
-   CPU round-trip remains only for non-stick-aligned head dims (MiniLM `D=32`), which slice
-   `D` back on the host.
+Everything hangs off one number, `R = encoder_budget_rows(...)`: the token budget, capped
+at 2048, floored at `max_model_len` rounded up to a power-of-two multiple of 64, capped at
+what `max_num_seqs` sequences of that length could carry, and finally floored to a whole
+multiple of that longest length — which is what makes every declared length divide `R`. **The pooling body is always `R` rows.** Fixing it
+is what reduces the attention kernels' cache keys to the sequence shapes alone — both
+kernels take the body buffer as an argument, so a varying buffer size would multiply every
+attention graph.
 
-## Encoder / embedding models: target state
+On top of that one buffer sit two paths over a single power-of-two length ladder
+(`ENCODER_LEN_ALIGNMENT = 64` doubling up to `max_model_len`, rounded up to a power-of-two
+multiple of 64 — the same rounding a request's own extent gets, so the ladder declares
+exactly the extents a request can be assigned):
 
-Everything above describes what is implemented today. The diagram below is a **target
-state** — where the encoder path is heading once the compile-mode work lands, and not a
-description of current behaviour.
+1. **Rectangular path** — one rectangle per length, `B = R / L`, so a rectangle is exactly the
+   body buffer. The runner pads each sequence to `L` and the batch to `B` in `_preprocess`
+   (host-side, integer tensors only), so Q/K/V *are* the grid: `_encoder_rect_kernel`
+   reshapes, runs one `F.scaled_dot_product_attention`, and stores — no data movement
+   inside the layer. `_unpad_encoder_hidden` compacts the grid back before the pooler, at a
+   fixed row count so the gather does not specialise per token total.
+2. **Ragged path** — for a batch too wide for any rectangle. Q/K/V stay packed and requests
+   are grouped by their own padded extent; `_encoder_fused_kernel` does gather, attend and
+   scatter for one group in a single graph, keyed on `(width, extent)`. Request boundaries
+   ride in int32 row-index tables, so a card never does offset arithmetic on *shapes* —
+   offsets are data. A group wider than the widest declared width is chunked into
+   descending powers of two, so every dispatch lands on a warmed pair.
 
-The shape of that target: the model body compiled once per token bucket, attention
-shape-managed separately behind the opaque custom-op boundary, and a warmup that walks
-both sets of shape buckets so nothing compiles on the first request.
+The runner picks between them once per step in `_build_attention_metadata` and records the
+choice as the *type* of `attn_metadata.encoder_plan` (`EncoderRectPlan` versus a list of
+`EncoderGroupPlan`). It has to run there rather than in `forward`: the builder does a D2H
+read and an H2D convert, which inside a traced region become graph nodes. Because both
+paths stay behind the opaque `unified_attention_with_output`, the enclosing block graph is
+identical for either — one shape, shared — so path selection is never a branch inside a
+compiled region nor a dynamo guard.
+
+Three torch-spyre constraints shape the rest: a compile input's `storage_offset` is a
+Dynamo guard (torch-spyre#4449, which closed #3770) and for int32 is still dropped
+outright, so rows are gathered with `index_select` rather than sliced — a slice would
+either recompile per offset or read the wrong rows; there is no on-device `arange` or `full`, so every index and mask
+tensor is host-built and reaches the device in one `convert` per plan; and SDPA's
+decomposition does `amax` then `exp(scores - max)`, which NaNs a fully masked row — hence
+the `finfo.min / 2` mask fill and the single attendable key a batch-pad lane gets.
+
+## Encoder / embedding models: compile shape axes
+
+The body is compiled once, at `R` rows. Attention is shape-managed separately behind the
+opaque custom-op boundary: one rectangle per declared length on the rectangular path, one
+`(width, extent)` pair per group on the ragged one (a *group* being the requests that
+share one padded extent, attended together in one call). With `max_model_len=512`,
+`max_num_seqs=32` and a 2048-token budget that is 23 shapes — one body, four rectangles,
+18 group pairs — and at `max_num_seqs=4` only five, since no batch that narrow can miss
+the rectangular path.
 
 <figure markdown="span">
   ![Encoder target state](encoder-ideal-state.svg){: style="width: 140%; max-width: 1400px; margin-left: -20%" }
   <figcaption>
-    Target architecture for encoder / embedding models under
-    <code>STOCK_TORCH_COMPILE</code>. Two shape axes are bucketed independently: the
-    token count <code>T</code> for the model body, and <code>(S, L)</code> for
-    attention's dense grid — they are decoupled because attention builds its grid by
-    gathering rows rather than by being handed a reshaped tensor. The foot of the
-    diagram contrasts today's dense-grid strategy with the planned flash-style variant,
-    which would collapse the second axis and converge on the upstream design.
+    Encoder / embedding models under <code>STOCK_TORCH_COMPILE</code>, <strong>ragged path
+    only</strong>: attention over the packed list, grouped by each request's padded
+    extent. Predates the rectangular path and the single <code>R</code>-row body, so read the
+    body bucketing and the warmup sweep as historical; the grouping and the row-index
+    tables are still current. Regenerating it needs the <code>d2</code> toolchain.
   </figcaption>
 </figure>
 
