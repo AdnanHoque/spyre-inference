@@ -1008,6 +1008,31 @@ def test_head_major_batched_decode_matches_fp32_reference(
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
     indirect=True,
 )
+@pytest.mark.parametrize("split_index", [False, True], ids=["native_index", "split_index"])
+@pytest.mark.parametrize("for_each_tile", [False, True], ids=["python_walk", "tiled_walk"])
+def test_tiled_walk_eligibility_follows_split_index(
+    default_vllm_config, configure_compilation, monkeypatch, for_each_tile, split_index
+):
+    """Under the tiled walk only the head-major impl with the split index qualifies."""
+    from spyre_inference.v1.attention.backends import spyre_head_major_attn
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", for_each_tile)
+    # The module constant is the flag AND the tiled walk, as captured at import.
+    monkeypatch.setattr(spyre_head_major_attn, "_TEMP_SPLIT_INDEX", split_index and for_each_tile)
+    kwargs = dict(num_heads=8, head_size=64, scale=64**-0.5, num_kv_heads=4)
+
+    assert SpyreAttentionImpl(**kwargs)._batched_decode_supported() == (not for_each_tile)
+    assert SpyreHeadMajorAttentionImpl(**kwargs)._batched_decode_supported() == (
+        not for_each_tile or split_index
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
 def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, configure_compilation):
     """The batched kernel gathers whole pages, so its index is the builder's page ids.
 

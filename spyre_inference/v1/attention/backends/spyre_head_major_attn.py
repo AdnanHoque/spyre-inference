@@ -242,6 +242,10 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             )
         return self._kv_row_pool_device
 
+    def _tiled_batched_decode_supported(self) -> bool:
+        # The split index below uploads one page ID per stick.
+        return _TEMP_SPLIT_INDEX
+
     def _mirror_batched_decode_indices(
         self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
     ) -> None:
