@@ -33,8 +33,6 @@ if TYPE_CHECKING:
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
-    SPYRE_ATTN_ENTRY_LOCAL_DECODE: bool = False
-    SPYRE_ATTN_TEMP_SPLIT_INDEX: bool = False
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
@@ -81,14 +79,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
     # one loop body. Enabled by default; "0" runs the same bodies under Python loops.
     "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "1"))),
-    # Head-major batched decode only: keep a running softmax per block slot and merge
-    # slots after the last chunk. Applies with >=2 chunks, with either loop mode.
-    "SPYRE_ATTN_ENTRY_LOCAL_DECODE": lambda: bool(
-        int(os.getenv("SPYRE_ATTN_ENTRY_LOCAL_DECODE", "0"))
-    ),
-    # TEMPORARY until torch-spyre#4603 is validated: one page-index entry per stick.
-    # Head-major batched decode only; ignored when SPYRE_ATTN_FOR_EACH_TILE=0.
-    "SPYRE_ATTN_TEMP_SPLIT_INDEX": lambda: bool(int(os.getenv("SPYRE_ATTN_TEMP_SPLIT_INDEX", "0"))),
     # Comma-separated kv_len buckets to record, unset uses the default buckets of
     # powers of two from block_size up to max_model_len.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
@@ -109,7 +99,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # When "1", enables the batched multi-sequence decode kernel for
     # batches of at least _MIN_BATCHED_SEQS sequences; smaller batches take the
     # per-seq loop either way. Disabled by default. Under the default tiled walk
-    # it applies only to the head-major cache with SPYRE_ATTN_TEMP_SPLIT_INDEX=1.
+    # it applies only to the head-major cache, which uses a split page index.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "0"))),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache

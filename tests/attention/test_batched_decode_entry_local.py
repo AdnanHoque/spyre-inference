@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Card-free tests for the opt-in entry-local batched-decode body."""
+"""Card-free tests for head-major batched decode and its automatic metadata layout."""
 
 from types import SimpleNamespace
 
@@ -83,18 +83,12 @@ def _meta(b, bpc, kv, q):
 def python_walk(monkeypatch):
     # The body math is under test; drive the Python walk (carry=None).
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
-    # The kernel captures these separately at import time. Isolate the tests
-    # from process-wide environment flags, including TEMP_SPLIT_INDEX=1.
+    # The kernel captures the walk mode separately at import time.
     monkeypatch.setattr(bdhm, "USE_FOR_EACH_TILE", False)
-    monkeypatch.setattr(bdhm, "TEMP_SPLIT_INDEX", False)
-    monkeypatch.setattr(bdhm, "ENTRY_LOCAL_DECODE", False)
 
 
 @pytest.mark.parametrize(("c", "kv", "q"), [(1, 1, 1), (2, 1, 1), (2, 2, 4)])
-def test_flag_off_matches_reference(monkeypatch, c, kv, q):
-    # Flag off is #876's branch by construction; this is numerical agreement with the
-    # independent reference, not bitwise identity to a pinned build.
-    monkeypatch.setattr(bdhm, "ENTRY_LOCAL_DECODE", False)
+def test_default_body_matches_reference(c, kv, q):
     b, bpc = 2, 2
     query, rep = _meta(b, bpc, kv, q)
     k_pages, v_pages, page_ids, mask, j_total = _inputs(b, bpc, c, kv)
@@ -104,32 +98,35 @@ def test_flag_off_matches_reference(monkeypatch, c, kv, q):
     )
 
 
-def test_flag_on_one_chunk_is_upstream(monkeypatch):
+def test_one_chunk_keeps_chunk_reduction(monkeypatch):
     b, bpc, c, kv, q = 2, 2, 1, 2, 4
     query, rep = _meta(b, bpc, kv, q)
-    k_pages, v_pages, page_ids, mask, _ = _inputs(b, bpc, c, kv)
-    monkeypatch.setattr(bdhm, "ENTRY_LOCAL_DECODE", False)
-    off = _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q)
-    monkeypatch.setattr(bdhm, "ENTRY_LOCAL_DECODE", True)
-    on = _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q)
-    assert torch.equal(on, off)
+    k_pages, v_pages, page_ids, mask, j_total = _inputs(b, bpc, c, kv)
+
+    def unexpected_merge(*args):
+        pytest.fail("A single chunk must not build and merge per-slot state")
+
+    monkeypatch.setattr(bdhm, "_merge_entry_local", unexpected_merge)
+    got = _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q)
+    torch.testing.assert_close(
+        got, _reference(query, k_pages, v_pages, page_ids, mask, b, j_total, kv, q, 0.0)
+    )
 
 
-def test_one_slot_per_chunk_matches_default_body(monkeypatch):
+def test_one_slot_per_chunk_matches_reference():
     """A one-slot carry has no cross-slot merge to defer (B32/1024 uses this)."""
     b, bpc, c, kv, q = 2, 1, 3, 2, 4
     query, rep = _meta(b, bpc, kv, q)
-    k_pages, v_pages, page_ids, mask, _ = _inputs(b, bpc, c, kv)
+    k_pages, v_pages, page_ids, mask, j_total = _inputs(b, bpc, c, kv)
     mask[-1, 0, 0, 0, 2:] = float("-inf")
-    off = _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q)
-    monkeypatch.setattr(bdhm, "ENTRY_LOCAL_DECODE", True)
-    on = _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q)
-    torch.testing.assert_close(on, off)
+    got = _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q)
+    torch.testing.assert_close(
+        got, _reference(query, k_pages, v_pages, page_ids, mask, b, j_total, kv, q, 0.0)
+    )
 
 
 @pytest.mark.parametrize("c", [2, 3])
-def test_flag_on_multi_chunk_masked(monkeypatch, c):
-    monkeypatch.setattr(bdhm, "ENTRY_LOCAL_DECODE", True)
+def test_multi_chunk_masked(c):
     b, bpc, kv, q, cap = 2, 2, 2, 4, 2.0
     query, rep = _meta(b, bpc, kv, q)
     k_pages, v_pages, page_ids, mask, j_total = _inputs(b, bpc, c, kv)
@@ -183,9 +180,8 @@ def test_body_matches_reference_with_init_state():
 
 
 @pytest.mark.parametrize("c", [1, 3])
-@pytest.mark.parametrize("entry_local", [False, True])
 @pytest.mark.parametrize("split_index", [False, True])
-def test_uploaded_metadata_matches_kernel(monkeypatch, c, entry_local, split_index):
+def test_uploaded_metadata_matches_kernel(monkeypatch, c, split_index):
     """Feed the production upload's metadata to the whole kernel on CPU.
 
     Only the device transfer is replaced. The Python walk emulates chunk
@@ -219,10 +215,8 @@ def test_uploaded_metadata_matches_kernel(monkeypatch, c, entry_local, split_ind
         return original_to(tensor, *args, **kwargs)
 
     monkeypatch.setattr(torch.Tensor, "to", cpu_transfer)
-    monkeypatch.setattr(backend, "_TEMP_SPLIT_INDEX", split_index)
+    monkeypatch.setattr(backend, "USE_FOR_EACH_TILE", split_index)
     monkeypatch.setattr(bdhm, "USE_FOR_EACH_TILE", split_index)
-    monkeypatch.setattr(bdhm, "TEMP_SPLIT_INDEX", split_index)
-    monkeypatch.setattr(bdhm, "ENTRY_LOCAL_DECODE", entry_local)
     impl = object.__new__(backend.SpyreHeadMajorAttentionImpl)
     impl._mirror_batched_decode_indices(metadata, torch.device("cpu"))
     assert len(layouts) == int(split_index)

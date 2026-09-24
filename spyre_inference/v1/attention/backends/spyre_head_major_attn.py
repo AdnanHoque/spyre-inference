@@ -44,9 +44,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _call_kernel,
 )
 from spyre_inference.v1.attention.ops.batched_decode_head_major import (
-    TEMP_SPLIT_INDEX as _TEMP_SPLIT_INDEX,
-)
-from spyre_inference.v1.attention.ops.batched_decode_head_major import (
     batched_decode_head_major_kernel,
 )
 from spyre_inference.v1.attention.ops.layout import (
@@ -244,14 +241,14 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
 
     def _tiled_batched_decode_supported(self) -> bool:
         # The split index below uploads one page ID per stick.
-        return _TEMP_SPLIT_INDEX
+        return True
 
     def _mirror_batched_decode_indices(
         self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
     ) -> None:
         # TEMPORARY until torch-spyre#4603 is validated: each page ID gets its own
         # stick. Preserve the CPU metadata shapes used by the recorder and dispatch.
-        if not _TEMP_SPLIT_INDEX:
+        if not USE_FOR_EACH_TILE:
             return super()._mirror_batched_decode_indices(attn_metadata, device)
         assert attn_metadata.rep_row_ids_cpu is not None
         assert attn_metadata.chunk_page_ids_cpu is not None

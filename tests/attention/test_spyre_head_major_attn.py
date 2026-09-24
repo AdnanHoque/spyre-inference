@@ -912,7 +912,7 @@ def test_page_attn_head_major_matches_fp32_reference():
         pytest.param(4, 4, 12, 8, 2, 1, True, id="padded_block_axis_ragged"),
     ],
 )
-def test_head_major_batched_decode_matches_fp32_reference(
+def test_head_major_decode_body_matches_fp32_reference(
     num_seqs: int,
     b_seqs: int,
     num_blocks: int,
@@ -920,13 +920,18 @@ def test_head_major_batched_decode_matches_fp32_reference(
     num_kv_heads: int,
     qpk: int,
     ragged: bool,
+    monkeypatch,
 ) -> None:
-    """The head-major page read feeds the same reduction the token-major kernel gets.
+    """The head-major page read and reduction agree with a full-sequence reference.
 
     Card-free and fp32, as its token-major twin: it pins the read and the entry-major,
     kv-minor row order the mask is broadcast in, not the fp16 tolerances.
     """
+    from spyre_inference.v1.attention.ops import batched_decode_head_major, tile_loop
     from tests.attention.test_spyre_attn import _decode_reference_fp32
+
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    monkeypatch.setattr(batched_decode_head_major, "USE_FOR_EACH_TILE", False)
 
     torch.set_default_device("cpu")
     set_random_seed(0)
@@ -1008,24 +1013,22 @@ def test_head_major_batched_decode_matches_fp32_reference(
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
     indirect=True,
 )
-@pytest.mark.parametrize("split_index", [False, True], ids=["native_index", "split_index"])
+@pytest.mark.parametrize("batched_decode", [False, True], ids=["disabled", "enabled"])
 @pytest.mark.parametrize("for_each_tile", [False, True], ids=["python_walk", "tiled_walk"])
-def test_tiled_walk_eligibility_follows_split_index(
-    default_vllm_config, configure_compilation, monkeypatch, for_each_tile, split_index
+def test_tiled_walk_eligibility_follows_backend(
+    default_vllm_config, configure_compilation, monkeypatch, for_each_tile, batched_decode
 ):
-    """Under the tiled walk only the head-major impl with the split index qualifies."""
-    from spyre_inference.v1.attention.backends import spyre_head_major_attn
+    """Head-major uploads the split index automatically; token-major stays guarded."""
+    from spyre_inference.v1.attention.ops import tile_loop
 
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", str(int(batched_decode)))
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", for_each_tile)
-    # The module constant is the flag AND the tiled walk, as captured at import.
-    monkeypatch.setattr(spyre_head_major_attn, "_TEMP_SPLIT_INDEX", split_index and for_each_tile)
     kwargs = dict(num_heads=8, head_size=64, scale=64**-0.5, num_kv_heads=4)
 
-    assert SpyreAttentionImpl(**kwargs)._batched_decode_supported() == (not for_each_tile)
-    assert SpyreHeadMajorAttentionImpl(**kwargs)._batched_decode_supported() == (
-        not for_each_tile or split_index
+    assert SpyreAttentionImpl(**kwargs)._batched_decode_supported() == (
+        batched_decode and not for_each_tile
     )
+    assert SpyreHeadMajorAttentionImpl(**kwargs)._batched_decode_supported() == batched_decode
 
 
 @pytest.mark.parametrize(

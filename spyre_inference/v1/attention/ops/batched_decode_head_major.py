@@ -17,23 +17,15 @@
 Each index selects a whole page containing all KV heads. The page is already
 head-major, so the token-major kernel's per-chunk permutation is unnecessary.
 
-By default, each chunk's blocks merge into one running softmax per sequence and
-query head. Entry-local mode instead keeps one running softmax per block slot
-across chunks and merges the slots once afterward. For two slots, slot 0 processes
+With multiple chunks, each block slot keeps its own running softmax across
+chunks; the slots merge once afterward. For two slots, slot 0 processes
 blocks 0, 2, 4, ... and slot 1 processes blocks 1, 3, 5, ... of each sequence.
 Only the temporary softmax state grows; the permanent KV cache is unchanged.
 """
 
 import torch
 
-from spyre_inference import envs
 from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE, walk_tiles
-
-# Read at module scope like the walk-mode flag: process-wide choices.
-ENTRY_LOCAL_DECODE = envs.SPYRE_ATTN_ENTRY_LOCAL_DECODE
-# TEMPORARY until torch-spyre#4603 is validated. The upload and kernel share this
-# process-wide choice so they agree on the index shape; Python walks stay native.
-TEMP_SPLIT_INDEX = envs.SPYRE_ATTN_TEMP_SPLIT_INDEX and USE_FOR_EACH_TILE
 
 
 def _entry_local_update(
@@ -124,12 +116,12 @@ def batched_decode_head_major_kernel(
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
     # Workaround walk only exists on the tiled path; the Python walk keeps #876's index.
-    split_index = TEMP_SPLIT_INDEX
+    split_index = USE_FOR_EACH_TILE
     num_chunks = (
         chunk_page_ids.shape[0] if split_index else chunk_page_ids.shape[0] // blocks_per_chunk
     )
     # With one chunk there is no repeated cross-slot merge to defer.
-    use_entry_local = ENTRY_LOCAL_DECODE and num_chunks > 1
+    use_entry_local = num_chunks > 1
     q = query.index_select(0, rep_row_ids).reshape(
         entries, num_kv_heads, num_queries_per_kv, head_size
     )
