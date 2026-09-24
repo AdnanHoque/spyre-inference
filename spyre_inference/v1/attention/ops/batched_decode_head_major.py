@@ -14,13 +14,14 @@
 
 """Batched multi-sequence decode over a head-major KV cache.
 
-The reduction is ``batched_decode``'s, chunk for chunk; only the page read differs.
-One index row per page, as token-major, but this layout stores the page head-major
-already, so the permute token-major does per chunk disappears.
+Each index selects a whole page containing all KV heads. The page is already
+head-major, so the token-major kernel's per-chunk permutation is unnecessary.
 
-Not the folded ``(page, kv_head)`` rows the per-sequence kernel gathers: the two move the
-same bytes, but folding costs ``num_kv_heads`` times the index entries, and gather time
-scales with entries rather than bytes -- measured at ~2x the kernel time for 8 kv heads.
+By default, each chunk's blocks merge into one running softmax per sequence and
+query head. Entry-local mode instead keeps one running softmax per block slot
+across chunks and merges the slots once afterward. For two slots, slot 0 processes
+blocks 0, 2, 4, ... and slot 1 processes blocks 1, 3, 5, ... of each sequence.
+Only the temporary softmax state grows; the permanent KV cache is unchanged.
 """
 
 import torch
@@ -30,8 +31,9 @@ from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE, walk_t
 
 # Read at module scope like the walk-mode flag: process-wide choices.
 ENTRY_LOCAL_DECODE = envs.SPYRE_ATTN_ENTRY_LOCAL_DECODE
-# TEMPORARY WORKAROUND (torch-spyre#4603): chunk-major index walked one chunk per trip.
-TEMP_SPLIT_INDEX = envs.SPYRE_ATTN_TEMP_SPLIT_INDEX
+# TEMPORARY until torch-spyre#4603 is validated. The upload and kernel share this
+# process-wide choice so they agree on the index shape; Python walks stay native.
+TEMP_SPLIT_INDEX = envs.SPYRE_ATTN_TEMP_SPLIT_INDEX and USE_FOR_EACH_TILE
 
 
 def _entry_local_update(
@@ -46,13 +48,16 @@ def _entry_local_update(
     block_size,
     head_size,
 ):
-    """One chunk's per-block-slot online-softmax update; state kept across chunks."""
+    """Update each slot's maximum, unnormalized sum and weighted-value sum."""
 
     def pv(probs):
         return torch.matmul(
             probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size), v_page
         ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size)
 
+    # A slot can be masked in every chunk. A finite sentinel avoids -inf - -inf;
+    # its weight vanishes at the final merge against a slot with valid scores.
+    # The metadata builder gives every real sequence at least one valid token.
     sc = torch.clamp(sc, min=torch.finfo(sc.dtype).min)
     pos_max = torch.amax(sc, dim=-1, keepdim=True)
     if carry is None:
@@ -78,7 +83,7 @@ def _merge_entry_local(
     num_queries_per_kv,
     head_size,
 ):
-    """The one final merge over the ``blocks_per_chunk`` slots held in the carry."""
+    """Rescale slots to a common maximum, sum them, then normalize once."""
     merged_max = torch.amax(tile_max, dim=0, keepdim=True)
     weight = torch.exp(tile_max - merged_max)
     merged_sum = torch.sum(weight * tile_sum, dim=0)
@@ -103,21 +108,27 @@ def batched_decode_head_major_kernel(
     logits_soft_cap=0.0,
     out=None,
 ):
-    """Shapes as in ``batched_decode_kernel``, except k/v_pages are the unfolded
-    head-major cache, [num_pages_total, num_kv_heads, block_size, head_size].
+    """Read head-major pages and compute one decode output per sequence/query head.
 
-    One index row per page rather than per (page, kv_head): the gather then splits on the
-    axis that stays the matmul's batch dim 0, as token-major's does, and the page still
-    arrives head-major so there is no permute either.
+    K/V: [num_pages_total, num_kv_heads, block_size, head_size]. Let C be the
+    number of chunks, J=blocks_per_chunk, B=num_seqs and E=J*B. Within a chunk,
+    entry j*B+s selects block slot j for sequence s; rep_row_ids repeats the
+    sequence's query in that same order.
+
+    Native metadata: page IDs [C*J, B], mask [C*J, B, H, 1, block_size].
+    Temporary split-index metadata: IDs [C, E, 1], mask [C, J, B, H, 1, block_size].
+    H is num_kv_heads for the tiled walk and 1 (broadcast) for the Python walk.
+    The split-index form is used only with for_each_tile; its explicit device
+    layout places each page ID in a separate stick so entries can split across cores.
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
     # Workaround walk only exists on the tiled path; the Python walk keeps #876's index.
-    split_index = TEMP_SPLIT_INDEX and USE_FOR_EACH_TILE
+    split_index = TEMP_SPLIT_INDEX
     num_chunks = (
         chunk_page_ids.shape[0] if split_index else chunk_page_ids.shape[0] // blocks_per_chunk
     )
-    # One chunk is upstream's flat branch; entry-local only pays across >1 chunk.
+    # With one chunk there is no repeated cross-slot merge to defer.
     use_entry_local = ENTRY_LOCAL_DECODE and num_chunks > 1
     q = query.index_select(0, rep_row_ids).reshape(
         entries, num_kv_heads, num_queries_per_kv, head_size

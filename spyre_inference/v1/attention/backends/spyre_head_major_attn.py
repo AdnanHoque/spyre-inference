@@ -44,7 +44,9 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _call_kernel,
 )
 from spyre_inference.v1.attention.ops.batched_decode_head_major import (
-    TEMP_SPLIT_INDEX,
+    TEMP_SPLIT_INDEX as _TEMP_SPLIT_INDEX,
+)
+from spyre_inference.v1.attention.ops.batched_decode_head_major import (
     batched_decode_head_major_kernel,
 )
 from spyre_inference.v1.attention.ops.layout import (
@@ -64,9 +66,6 @@ from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE
 from spyre_inference.v1.worker import compile_guard
 
 logger = init_logger(__name__)
-
-# One module-time predicate, matching the kernel's own captured constants.
-_TEMP_SPLIT_INDEX = TEMP_SPLIT_INDEX and USE_FOR_EACH_TILE
 
 # Compiled apart from the token-major kernels: same reason those are compiled at module
 # scope, and a shared artifact would guard on the page shape either way.
@@ -246,8 +245,8 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     def _mirror_batched_decode_indices(
         self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
     ) -> None:
-        # TEMPORARY WORKAROUND (torch-spyre#4603): upload the chunk-major index with the
-        # proven layout; the CPU fields keep their main shape for every other reader.
+        # TEMPORARY until torch-spyre#4603 is validated: each page ID gets its own
+        # stick. Preserve the CPU metadata shapes used by the recorder and dispatch.
         if not _TEMP_SPLIT_INDEX:
             return super()._mirror_batched_decode_indices(attn_metadata, device)
         assert attn_metadata.rep_row_ids_cpu is not None

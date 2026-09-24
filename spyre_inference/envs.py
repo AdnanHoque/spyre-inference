@@ -81,12 +81,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
     # one loop body. Enabled by default; "0" runs the same bodies under Python loops.
     "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "1"))),
-    # Opt in to the entry-local batched-decode body: a per block-slot running softmax across
-    # chunks, merged once. Applies to batched decode with >=2 chunks only; off by default.
+    # Head-major batched decode only: keep a running softmax per block slot and merge
+    # slots after the last chunk. Applies with >=2 chunks, with either loop mode.
     "SPYRE_ATTN_ENTRY_LOCAL_DECODE": lambda: bool(
         int(os.getenv("SPYRE_ATTN_ENTRY_LOCAL_DECODE", "0"))
     ),
-    # TEMPORARY WORKAROUND (torch-spyre#4603): chunk-major page index for the tiled walk.
+    # TEMPORARY until torch-spyre#4603 is validated: one page-index entry per stick.
+    # Head-major batched decode only; ignored when SPYRE_ATTN_FOR_EACH_TILE=0.
     "SPYRE_ATTN_TEMP_SPLIT_INDEX": lambda: bool(int(os.getenv("SPYRE_ATTN_TEMP_SPLIT_INDEX", "0"))),
     # Comma-separated kv_len buckets to record, unset uses the default buckets of
     # powers of two from block_size up to max_model_len.

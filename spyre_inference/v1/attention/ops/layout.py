@@ -38,10 +38,12 @@ def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtyp
 
 
 def temporary_chunk_major_page_index_layout(num_chunks: int, entries_per_chunk: int):
-    """TEMPORARY WORKAROUND for torch-spyre#4603. The proven host ``[C, E, 1]`` / device
-    ``[C, 1, E, 32]`` layout for a chunk-major index walked one chunk per trip. Remove it
-    once #876's native 2-D index compiles, gives exact values and splits across cores on a
-    compiler with the index-stick split; the stacked-int32-view offset bug is separate.
+    """TEMPORARY until torch-spyre#4603 is validated: one page ID per 128-byte stick.
+
+    Logical ``[C, E, 1]`` maps to device ``[C, 1, E, 32]``: each int32 ID uses
+    one of a stick's 32 positions. Only index metadata expands, not the KV cache.
+    Remove this layout and its upload/kernel branches once the native 2-D index
+    compiles, returns correct values and splits across cores in emitted code.
     """
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 

@@ -14,6 +14,8 @@
 
 """Card-free tests for the opt-in entry-local batched-decode body."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -81,6 +83,11 @@ def _meta(b, bpc, kv, q):
 def python_walk(monkeypatch):
     # The body math is under test; drive the Python walk (carry=None).
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    # The kernel captures these separately at import time. Isolate the tests
+    # from process-wide environment flags, including TEMP_SPLIT_INDEX=1.
+    monkeypatch.setattr(bdhm, "USE_FOR_EACH_TILE", False)
+    monkeypatch.setattr(bdhm, "TEMP_SPLIT_INDEX", False)
+    monkeypatch.setattr(bdhm, "ENTRY_LOCAL_DECODE", False)
 
 
 @pytest.mark.parametrize(("c", "kv", "q"), [(1, 1, 1), (2, 1, 1), (2, 2, 4)])
@@ -106,6 +113,18 @@ def test_flag_on_one_chunk_is_upstream(monkeypatch):
     monkeypatch.setattr(bdhm, "ENTRY_LOCAL_DECODE", True)
     on = _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q)
     assert torch.equal(on, off)
+
+
+def test_one_slot_per_chunk_matches_default_body(monkeypatch):
+    """A one-slot carry has no cross-slot merge to defer (B32/1024 uses this)."""
+    b, bpc, c, kv, q = 2, 1, 3, 2, 4
+    query, rep = _meta(b, bpc, kv, q)
+    k_pages, v_pages, page_ids, mask, _ = _inputs(b, bpc, c, kv)
+    mask[-1, 0, 0, 0, 2:] = float("-inf")
+    off = _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q)
+    monkeypatch.setattr(bdhm, "ENTRY_LOCAL_DECODE", True)
+    on = _call(query, rep, k_pages, v_pages, page_ids, mask, b, bpc, kv, q)
+    torch.testing.assert_close(on, off)
 
 
 @pytest.mark.parametrize("c", [2, 3])
@@ -163,18 +182,72 @@ def test_body_matches_reference_with_init_state():
     )
 
 
-def test_temp_split_host_reshape_order():
-    """The workaround's host [C, E, 1] reshape keeps the (j, s) entry order #876 uses."""
-    b, bpc, c = 2, 2, 3
-    j_total = c * bpc
-    ids = torch.arange(j_total * b, dtype=torch.int32).reshape(j_total, b)
-    reshaped = ids.reshape(c, bpc, b).reshape(c, bpc * b, 1)
-    rep = torch.arange(b).repeat(bpc)
-    for ch in range(c):
-        for e in range(bpc * b):
-            jj, s = divmod(e, b)
-            assert int(reshaped[ch, e, 0]) == int(ids[ch * bpc + jj, s])
-            assert int(rep[e]) == s
+@pytest.mark.parametrize("c", [1, 3])
+@pytest.mark.parametrize("entry_local", [False, True])
+@pytest.mark.parametrize("split_index", [False, True])
+def test_uploaded_metadata_matches_kernel(monkeypatch, c, entry_local, split_index):
+    """Feed the production upload's metadata to the whole kernel on CPU.
+
+    Only the device transfer is replaced. The Python walk emulates chunk
+    boundaries, including the split-index shape branch; this does not test
+    compiled for_each_tile execution or the device's physical index layout.
+    """
+    from spyre_inference.v1.attention.backends import spyre_head_major_attn as backend
+
+    b, bpc, kv, q = 2, 2, 2, 4
+    query, rep = _meta(b, bpc, kv, q)
+    k_pages, v_pages, page_ids, mask, j_total = _inputs(b, bpc, c, kv)
+    mask[0, 0, 0, 0, 2:] = float("-inf")
+    mask[::bpc, 1] = float("-inf")
+    if split_index:
+        # The tiled walk's builder materializes the KV-head axis.
+        mask = mask.expand(-1, -1, kv, -1, -1).contiguous()
+    original_ids, original_mask = page_ids.clone(), mask.clone()
+    metadata = SimpleNamespace(
+        padded_num_seqs=b,
+        blocks_per_chunk=bpc,
+        rep_row_ids_cpu=rep,
+        chunk_page_ids_cpu=page_ids,
+        mask_by_chunk_cpu=mask,
+    )
+    layouts = []
+    original_to = torch.Tensor.to
+
+    def cpu_transfer(tensor, *args, **kwargs):
+        if "device_layout" in kwargs:
+            layouts.append(kwargs.pop("device_layout"))
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", cpu_transfer)
+    monkeypatch.setattr(backend, "_TEMP_SPLIT_INDEX", split_index)
+    monkeypatch.setattr(bdhm, "USE_FOR_EACH_TILE", split_index)
+    monkeypatch.setattr(bdhm, "TEMP_SPLIT_INDEX", split_index)
+    monkeypatch.setattr(bdhm, "ENTRY_LOCAL_DECODE", entry_local)
+    impl = object.__new__(backend.SpyreHeadMajorAttentionImpl)
+    impl._mirror_batched_decode_indices(metadata, torch.device("cpu"))
+    assert len(layouts) == int(split_index)
+    if split_index:
+        assert list(layouts[0].device_size) == [c, 1, bpc * b, 32]
+    got = _call(
+        query,
+        metadata.rep_row_ids_dev,
+        k_pages,
+        v_pages,
+        metadata.chunk_page_ids_dev,
+        metadata.mask_by_chunk_dev,
+        b,
+        bpc,
+        kv,
+        q,
+    )
+    torch.testing.assert_close(
+        got,
+        _reference(query, k_pages, v_pages, original_ids, original_mask, b, j_total, kv, q, 0.0),
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    assert torch.equal(metadata.chunk_page_ids_cpu, original_ids)
+    assert torch.equal(metadata.mask_by_chunk_cpu, original_mask)
 
 
 def test_temp_split_layout_fields():
