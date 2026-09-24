@@ -70,6 +70,15 @@ jobs:
       INGEST_SCHEMA: both
 
     steps:
+      # Nested local `uses: ./...` actions inside ingest-hw-diagnostics-to-clickhouse resolve against this checkout, not torch-spyre's own repo.
+      - name: Checkout torch-spyre composite actions
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: torch-spyre/torch-spyre
+          sparse-checkout: |
+            .github/actions
+          sparse-checkout-cone-mode: false
+
       - name: Ingest hardware-failure diagnostics into ClickHouse
         id: ingest
         uses: torch-spyre/torch-spyre/.github/actions/ingest-hw-diagnostics-to-clickhouse@main
