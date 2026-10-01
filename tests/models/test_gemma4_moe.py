@@ -669,11 +669,14 @@ def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_to
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [24, 32])
+# 8 and 16 are the decode batches serving sends here (above SPYRE_MOE_GATHERED_MAX_TOKENS),
+# and 512 is one prefill chunk; each splits the token axis differently.
+@pytest.mark.parametrize("num_tokens", [8, 16, 24, 32, 512])
 def test_persistent_matches_dense_reference(moe_weights, num_tokens):
-    """The prefill form, in the region sequence ``apply_monolithic`` uses.
+    """The all-expert form, in the region sequence ``apply_monolithic`` uses.
 
     24 tokens does not divide the core count, which the work-division hint has to cope with.
+    With ``moe_weights`` every row count runs at the native and the TP=2-widened width.
     """
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
