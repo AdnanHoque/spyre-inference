@@ -65,7 +65,8 @@ def moe_weights(request):
     added lanes must not reach the result: that inertness is what lets TP narrow ``M``.
     """
     from torch_spyre._C import get_elem_in_stick
-    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
+
+    from spyre_inference.moe import _to_spyre_expert_weight
 
     inter = request.param
     pad = -inter % get_elem_in_stick(torch.float16)
@@ -86,8 +87,11 @@ def moe_weights(request):
         stacks["gate"] = F.pad(stacks["gate"], (0, pad))
         stacks["up"] = F.pad(stacks["up"], (0, pad))
         stacks["down"] = F.pad(stacks["down"], (0, 0, 0, pad))
-    device = {k: dma_moe_expert_weight_to_spyre(v) for k, v in stacks.items()}
-    assert all(v is not None for v in device.values()), "expert stacks must take the MoE layout"
+    # The production move, so each form runs on the layouts ``_prepare_layer`` gives it. Down
+    # goes last, as there: its move does not start the runtime the way the ``dma_*`` helpers do.
+    device = {
+        k: _to_spyre_expert_weight(v, (), kernel_order=k == "down") for k, v in stacks.items()
+    }
     return host, device
 
 
@@ -596,7 +600,7 @@ STICK_EXPERTS = 64
 @pytest.fixture(scope="module")
 def stick_aligned_moe_weights():
     """Expert stacks whose count spans whole sticks, so a row slice is addressable."""
-    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
+    from spyre_inference.moe import _to_spyre_expert_weight
 
     torch.manual_seed(0)
     host = {
@@ -605,12 +609,11 @@ def stick_aligned_moe_weights():
         "down": torch.randn(STICK_EXPERTS, INTER, HIDDEN, dtype=torch.float16) * 0.05,
     }
     host["scale"] = torch.ones(STICK_EXPERTS, dtype=torch.float16)
+    # Down last, as in ``_prepare_layer``: its move does not start the runtime.
     device = {
-        "gate": dma_moe_expert_weight_to_spyre(host["gate"]),
-        "up": dma_moe_expert_weight_to_spyre(host["up"]),
-        "down": dma_moe_expert_weight_to_spyre(host["down"]),
+        k: _to_spyre_expert_weight(host[k], (), kernel_order=k == "down")
+        for k in ("gate", "up", "down")
     }
-    assert all(v is not None for v in device.values()), "expert stacks must take the MoE layout"
     return host, device
 
 
@@ -856,9 +859,10 @@ def test_prepare_layer_rejects_an_unaligned_hidden_size_before_relayout():
 def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
     """A model recipe may prepare down weights before generic relayout."""
 
-    from torch_spyre._C import get_elem_in_stick
+    from torch_spyre._C import get_elem_in_stick, get_spyre_tensor_layout
+    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
 
-    from spyre_inference.moe import SpyreMoERecipe, _prepare_layer
+    from spyre_inference.moe import SpyreMoERecipe, _prepare_layer, _to_spyre_expert_weight
 
     torch.manual_seed(0)
     w13 = torch.randn(EXPERTS, 2 * inter, HIDDEN, dtype=torch.float16) * 0.05
@@ -886,6 +890,15 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
     assert layer.spyre_moe_stick == stick
     assert layer.spyre_moe_route_identity.dtype == w13.dtype
 
+    # Gate and up keep the gather layout; down takes the matmul-weight order, columns outer.
+    # torch-spyre derives the down pair from ``dim_order``; these pin what it derives.
+    gather_layout = [EXPERTS, HIDDEN, width // stick, stick]
+    for stack in (layer.spyre_moe_gate, layer.spyre_moe_up):
+        assert get_spyre_tensor_layout(stack).device_size == gather_layout
+    down_layout = get_spyre_tensor_layout(layer.spyre_moe_down)
+    assert down_layout.device_size == [EXPERTS, HIDDEN // stick, width, stick]
+    assert down_layout.stride_map == [width * HIDDEN, stick, HIDDEN, 1]
+
     close = {"atol": 1e-4, "rtol": 1e-2}
     gate, up = (t.cpu() for t in (layer.spyre_moe_gate, layer.spyre_moe_up))
     down = layer.spyre_moe_down.cpu()
@@ -897,3 +910,52 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
     # The added lanes must be zero, which is what makes the widening inert.
     for padded in (gate[..., inter:], up[..., inter:], down[:, inter:]):
         assert not padded.count_nonzero()
+
+    # Exact, and only the layout differs: the same host stack moved in the gather layout and in
+    # the matmul-weight order goes through the same conversion, so it must read back bit for bit.
+    host_down = F.pad((w2 * scale.view(EXPERTS, 1, 1)).transpose(1, 2), (0, 0, 0, width - inter))
+    control = dma_moe_expert_weight_to_spyre(host_down)
+    candidate = _to_spyre_expert_weight(host_down, (), kernel_order=True)
+    assert control is not None
+    assert get_spyre_tensor_layout(candidate).device_size == down_layout.device_size
+    assert torch.equal(control.cpu(), candidate.cpu())
+    assert torch.equal(candidate.cpu(), down)
+
+
+@pytest.mark.parametrize(("contract", "free"), [(6, 4), (7, 4), (6, 1), (1, 3)])
+def test_expert_kernel_layout_keeps_experts_whole_and_stick_columns_contiguous(contract, free):
+    """The down stack's device order as torch-spyre derives it, checked as an address map.
+
+    Each device position must hold exactly one host element; each expert must be one block
+    (the loop steps through experts and the gather indexes them); and within an expert the
+    rows of one stick column must sit in adjacent sticks, which is what lets the matmul move a
+    column of its chunk as one transfer at any chunk width. Even and odd stick counts alike.
+    """
+    from itertools import product
+
+    from torch_spyre._C import get_elem_in_stick
+
+    from spyre_inference.moe import _expert_kernel_layout
+
+    experts, stick = 3, get_elem_in_stick(torch.float16)
+    free_elems = free * stick
+    stack = torch.empty(experts, contract, free_elems, dtype=torch.float16)
+    layout = _expert_kernel_layout(stack)
+    sizes, strides = list(layout.device_size), list(layout.stride_map)
+    assert sizes == [experts, free, contract, stick]
+
+    host_at = {}  # device position -> host flat index
+    for position, coords in enumerate(product(*(range(n) for n in sizes))):
+        host_at[position] = sum(c * s for c, s in zip(coords, strides))
+    assert sorted(host_at.values()) == list(range(experts * contract * free_elems))
+
+    block = contract * free_elems
+    for position, flat in host_at.items():
+        assert position // block == flat // block, "an expert must stay one contiguous block"
+    for e, s, c in product(range(experts), range(free), range(contract)):
+        first = ((e * free + s) * contract + c) * stick
+        # Host element (row c, column s * stick) of expert e, at the start of its stick ...
+        assert host_at[first] == e * block + c * free_elems + s * stick
+        # ... and the next row of the same column starts the very next stick.
+        if c + 1 < contract:
+            assert host_at[first + stick] == host_at[first] + free_elems
