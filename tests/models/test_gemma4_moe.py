@@ -95,10 +95,30 @@ def moe_weights(request):
     return host, device
 
 
-def _inputs(num_tokens):
+# The smallest gap, in logits, kept between a row's k-th and (k+1)-th expert. At a tie "the
+# top k" is two different sets, and the comparison would test the tie-break, not the MoE: the
+# card keeps the higher expert index where ``torch.topk`` on the CPU kept the lower one. The
+# card also computes the routing softmax in its own fp16 format (9 fraction bits), so
+# probabilities a few of its steps apart tie there while the CPU still orders them. 2**-5 in
+# logits is about 3 % apart in probability, many of the card's steps.
+_TOPK_MARGIN = 2.0**-5
+
+
+def _inputs(num_tokens, routing_margin=True):
     gen = torch.Generator().manual_seed(num_tokens)
     x = torch.randn(num_tokens, HIDDEN, dtype=torch.float16, generator=gen) * 0.5
     logits = torch.randn(num_tokens, EXPERTS, dtype=torch.float16, generator=gen)
+    if routing_margin:
+        # Where the boundary is closer than the margin, lift the row's top k (ties broken by
+        # index) by the margin. One shift common to the selected experts keeps the selected
+        # set and their renormalized routing weights; rows already clear are untouched.
+        order = torch.sort(logits.float(), dim=-1, descending=True, stable=True).indices
+        ranked = logits.float().gather(-1, order)
+        close = (ranked[:, TOP_K - 1] - ranked[:, TOP_K]) < _TOPK_MARGIN
+        lift = torch.zeros_like(logits).scatter_(-1, order[:, :TOP_K], _TOPK_MARGIN)
+        logits = torch.where(close.unsqueeze(-1), logits + lift, logits)
+        ranked = torch.sort(logits.float(), dim=-1, descending=True).values
+        assert (ranked[:, TOP_K - 1] - ranked[:, TOP_K] > _TOPK_MARGIN / 2).all()
     return x, logits
 
 
@@ -674,12 +694,19 @@ def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_to
 
 # 8 and 16 are the decode batches serving sends here (above SPYRE_MOE_GATHERED_MAX_TOKENS),
 # and 512 is one prefill chunk; each splits the token axis differently.
-@pytest.mark.parametrize("num_tokens", [8, 16, 24, 32, 512])
-def test_persistent_matches_dense_reference(moe_weights, num_tokens):
+@pytest.mark.parametrize(
+    ("num_tokens", "routing_margin"),
+    [(8, True), (16, True), (24, True), (32, True), (512, True), (512, False)],
+    ids=["8", "16", "24", "32", "512", "512-tied"],
+)
+def test_persistent_matches_dense_reference(moe_weights, num_tokens, routing_margin):
     """The all-expert form, in the region sequence ``apply_monolithic`` uses.
 
     24 tokens does not divide the core count, which the work-division hint has to cope with.
     With ``moe_weights`` every row count runs at the native and the TP=2-widened width.
+    ``512-tied`` keeps the raw 512-row draw, whose rows 328 and 332 hold exact top-k ties:
+    the card and the reference choose different experts there, so it fails until the
+    expected tie-break is decided.
     """
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
@@ -693,7 +720,7 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens):
     )
 
     host, device = moe_weights
-    x, logits = _inputs(num_tokens)
+    x, logits = _inputs(num_tokens, routing_margin)
     x_dev = x.to("spyre")
     stick = get_elem_in_stick(torch.float16)
     identity = torch.eye(stick, dtype=torch.float16).to("spyre")
