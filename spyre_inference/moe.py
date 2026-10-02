@@ -483,7 +483,7 @@ def _to_spyre_expert_weight(
     assert weight.shape[-1] % layout.elems_per_stick() == 0, "the free dim must span whole sticks"
     # A host tensor given only a device layout lands on the current Spyre device, as the
     # ``dma_*`` helpers' default does.
-    return weight.to(device_layout=layout)
+    return weight.to(device_layout=layout)  # ty: ignore[no-matching-overload]
 
 
 def _prepare_layer(layer: RoutedExperts) -> None:
