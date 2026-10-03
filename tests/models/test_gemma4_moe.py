@@ -35,9 +35,12 @@ EXPERTS, HIDDEN, INTER, TOP_K = 16, 256, 128, 4
 GEMMA4_EXPERTS = 128
 
 
-def _dense_reference(x, probs, gate, up, down, scale, top_k):
+def _dense_reference(x, probs, gate, up, down, scale, top_k, indices=None):
     """Top-k MoE evaluated one (token, expert) pair at a time, in float32."""
-    weights, indices = torch.topk(probs.float(), top_k, dim=-1)
+    if indices is None:
+        weights, indices = torch.topk(probs.float(), top_k, dim=-1)
+    else:
+        weights = probs.float().gather(-1, indices)
     weights = weights / weights.sum(-1, keepdim=True)
     out = torch.zeros_like(x, dtype=torch.float32)
     for token in range(x.shape[0]):
@@ -52,6 +55,85 @@ def _dense_reference(x, probs, gate, up, down, scale, top_k):
                 * float(scale[expert])
             )
     return out
+
+
+def _checked_route_indices(route, probs, top_k):
+    """Accept either expert at a tie, but check selection and weights on the CPU."""
+    assert route.shape == (*probs.shape, 1)
+    route = route[..., 0].float()
+    assert torch.isfinite(route).all()
+    assert (route >= 0).all()
+    selected = route > 0
+    assert (selected.sum(-1) == top_k).all(), "each row must select exactly top_k experts"
+    indices = selected.nonzero()[:, 1].reshape(probs.shape[0], top_k)
+    weights = probs.float().gather(-1, indices)
+    cutoff = torch.topk(probs.float(), top_k, dim=-1).values[:, -1:]
+    assert selected[probs.float() > cutoff].all(), "an expert above the CPU top-k cutoff is missing"
+    assert (weights >= cutoff).all(), "a selected expert is below the CPU top-k cutoff"
+    weights = weights / weights.sum(-1, keepdim=True)
+    expected = torch.zeros_like(route).scatter_(-1, indices, weights)
+    torch.testing.assert_close(route, expected, atol=2e-2, rtol=2e-2)
+    return indices
+
+
+@pytest.mark.parametrize("tied_expert", [1, 2])
+def test_checked_route_accepts_either_expert_at_a_tie(tied_expert):
+    probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]])
+    route = torch.zeros(1, 5, 1)
+    route[0, 0, 0] = 2 / 3
+    route[0, tied_expert, 0] = 1 / 3
+    indices = _checked_route_indices(route, probs, 2)
+    torch.testing.assert_close(indices, torch.tensor([[0, tied_expert]]))
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        [1.0, 0.0, 0.0, 0.0, 0.0],
+        [0.5, 0.25, 0.25, 0.0, 0.0],
+        [0.8, 0.0, 0.0, 0.2, 0.0],
+        [0.0, 0.5, 0.5, 0.0, 0.0],
+        [0.5, 0.5, 0.0, 0.0, 0.0],
+        [2 / 3, -1 / 3, 0.0, 0.0, 0.0],
+        [2 / 3, float("nan"), 0.0, 0.0, 0.0],
+    ],
+    ids=[
+        "too-few",
+        "too-many",
+        "below-cutoff",
+        "drops-higher",
+        "wrong-weights",
+        "negative",
+        "nonfinite",
+    ],
+)
+def test_checked_route_rejects_invalid_selection_or_weights(route):
+    probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]])
+    with pytest.raises(AssertionError):
+        _checked_route_indices(torch.tensor(route).reshape(1, 5, 1), probs, 2)
+
+
+def test_dense_reference_uses_cpu_weights_for_the_selected_experts():
+    x = torch.ones(1, 1)
+    probs = torch.tensor([[0.4, 0.2, 0.2, 0.1, 0.1]])
+    gate = up = torch.ones(5, 1, 1)
+    down = torch.arange(1, 6, dtype=torch.float32).reshape(5, 1, 1)
+    scale = torch.ones(5)
+    results = []
+    for tied_expert in (1, 2):
+        indices = torch.tensor([[0, tied_expert]])
+        actual = _dense_reference(x, probs, gate, up, down, scale, 2, indices)
+        expected = F.gelu(x, approximate="tanh") * (2 / 3 + (tied_expert + 1) / 3)
+        torch.testing.assert_close(actual, expected)
+        results.append(actual)
+    with pytest.raises(AssertionError):
+        torch.testing.assert_close(results[0], results[1], atol=2e-2, rtol=2e-2)
+    untied_probs = torch.tensor([[0.4, 0.3, 0.1, 0.1, 0.1]])
+    default_indices = torch.topk(untied_probs, 2, dim=-1).indices
+    torch.testing.assert_close(
+        _dense_reference(x, untied_probs, gate, up, down, scale, 2),
+        _dense_reference(x, untied_probs, gate, up, down, scale, 2, default_indices),
+    )
 
 
 # A whole number of sticks, and a TP shard that lands mid-stick with the same remainder
@@ -635,8 +717,8 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens, routing_mar
     24 tokens does not divide the core count, which the work-division hint has to cope with.
     With ``moe_weights`` every row count runs at the native and the TP=2-widened width.
     ``512-tied`` keeps the raw 512-row draw, whose rows 328 and 332 hold exact top-k ties:
-    the card and the reference choose different experts there, so it fails until the
-    expected tie-break is decided.
+    the card and CPU may choose different experts there. Check the card's choices against
+    the CPU scores, then compute their expected outputs with independent CPU arithmetic.
     """
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
@@ -672,14 +754,19 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens, routing_mar
         finally:
             reset_named_dims()
 
+    host_probs = torch.softmax(logits, dim=-1)
+    indices = None
+    if not routing_margin:
+        indices = _checked_route_indices(route.cpu(), host_probs, TOP_K)
     expected = _dense_reference(
         x,
-        torch.softmax(logits, dim=-1),
+        host_probs,
         host["gate"],
         host["up"],
         host["down"],
         host["scale"],
         TOP_K,
+        indices,
     )
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
