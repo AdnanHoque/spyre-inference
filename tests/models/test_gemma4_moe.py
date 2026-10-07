@@ -169,20 +169,15 @@ def moe_weights(request):
         stacks["gate"] = F.pad(stacks["gate"], (0, pad))
         stacks["up"] = F.pad(stacks["up"], (0, pad))
         stacks["down"] = F.pad(stacks["down"], (0, 0, 0, pad))
-    # The production move, so each form runs on the layouts ``_prepare_layer`` gives it. Down
-    # goes last, as there: its move does not start the runtime the way the ``dma_*`` helpers do.
+    # Production move and order: down last, since its move does not start the runtime.
     device = {
         k: _to_spyre_expert_weight(v, (), kernel_order=k == "down") for k, v in stacks.items()
     }
     return host, device
 
 
-# The smallest gap, in logits, kept between a row's k-th and (k+1)-th expert. At a tie "the
-# top k" is two different sets, and the comparison would test the tie-break, not the MoE: the
-# card keeps the higher expert index where ``torch.topk`` on the CPU kept the lower one. The
-# card also computes the routing softmax in its own fp16 format (9 fraction bits), so
-# probabilities a few of its steps apart tie there while the CPU still orders them. 2**-5 in
-# logits is about 3 % apart in probability, many of the card's steps.
+# Minimum logit gap kept at the top-k boundary: the card breaks ties toward the higher expert
+# and rounds the routing softmax to 9 fraction bits, so its near-ties need not match the CPU's.
 _TOPK_MARGIN = 2.0**-5
 
 
@@ -191,9 +186,7 @@ def _inputs(num_tokens, routing_margin=True):
     x = torch.randn(num_tokens, HIDDEN, dtype=torch.float16, generator=gen) * 0.5
     logits = torch.randn(num_tokens, EXPERTS, dtype=torch.float16, generator=gen)
     if routing_margin:
-        # Where the boundary is closer than the margin, lift the row's top k (ties broken by
-        # index) by the margin. One shift common to the selected experts keeps the selected
-        # set and their renormalized routing weights; rows already clear are untouched.
+        # A common lift of a close row's top k keeps the selected set and its routing weights.
         order = torch.sort(logits.float(), dim=-1, descending=True, stable=True).indices
         ranked = logits.float().gather(-1, order)
         close = (ranked[:, TOP_K - 1] - ranked[:, TOP_K]) < _TOPK_MARGIN
@@ -774,8 +767,7 @@ def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_to
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
-# 8 and 16 are the decode batches serving sends here (above SPYRE_MOE_GATHERED_MAX_TOKENS),
-# and 512 is one prefill chunk; each splits the token axis differently.
+# 8 and 16: decode batches above SPYRE_MOE_GATHERED_MAX_TOKENS; 512: one prefill chunk.
 @pytest.mark.parametrize(
     ("num_tokens", "routing_margin"),
     [(8, True), (16, True), (24, True), (32, True), (512, True), (512, False)],
@@ -785,10 +777,8 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens, routing_mar
     """The all-expert form, in the region sequence ``apply_monolithic`` uses.
 
     24 tokens does not divide the core count, which the work-division hint has to cope with.
-    With ``moe_weights`` every row count runs at the native and the TP=2-widened width.
-    ``512-tied`` keeps the raw 512-row draw, whose rows 328 and 332 hold exact top-k ties:
-    the card and CPU may choose different experts there. Check the card's choices against
-    the CPU scores, then compute their expected outputs with independent CPU arithmetic.
+    ``512-tied`` keeps the raw draw's exact ties; there the card's choices are checked against
+    CPU scores.
     """
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
@@ -1004,8 +994,6 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
     assert layer.spyre_moe_stick == stick
     assert layer.spyre_moe_route_identity.dtype == w13.dtype
 
-    # Gate and up keep the gather layout; down takes the matmul-weight order, columns outer.
-    # torch-spyre derives the down pair from ``dim_order``; these pin what it derives.
     gather_layout = [EXPERTS, HIDDEN, width // stick, stick]
     for stack in (layer.spyre_moe_gate, layer.spyre_moe_up):
         assert get_spyre_tensor_layout(stack).device_size == gather_layout
@@ -1025,8 +1013,7 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
     for padded in (gate[..., inter:], up[..., inter:], down[:, inter:]):
         assert not padded.count_nonzero()
 
-    # Exact, and only the layout differs: the same host stack moved in the gather layout and in
-    # the matmul-weight order goes through the same conversion, so it must read back bit for bit.
+    # Only the layout differs, so both moves must read back bit for bit.
     host_down = F.pad((w2 * scale.view(EXPERTS, 1, 1)).transpose(1, 2), (0, 0, 0, width - inter))
     control = dma_moe_expert_weight_to_spyre(host_down)
     candidate = _to_spyre_expert_weight(host_down, (), kernel_order=True)
@@ -1038,13 +1025,7 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
 
 @pytest.mark.parametrize(("contract", "free"), [(6, 4), (7, 4), (6, 1), (1, 3)])
 def test_expert_kernel_layout_keeps_experts_whole_and_stick_columns_contiguous(contract, free):
-    """The down stack's device order as torch-spyre derives it, checked as an address map.
-
-    Each device position must hold exactly one host element; each expert must be one block
-    (the loop steps through experts and the gather indexes them); and within an expert the
-    rows of one stick column must sit in adjacent sticks, which is what lets the matmul move a
-    column of its chunk as one transfer at any chunk width. Even and odd stick counts alike.
-    """
+    """Checks the device-to-host address map, at even and odd stick counts."""
     from itertools import product
 
     from torch_spyre._C import get_elem_in_stick
@@ -1068,8 +1049,7 @@ def test_expert_kernel_layout_keeps_experts_whole_and_stick_columns_contiguous(c
         assert position // block == flat // block, "an expert must stay one contiguous block"
     for e, s, c in product(range(experts), range(free), range(contract)):
         first = ((e * free + s) * contract + c) * stick
-        # Host element (row c, column s * stick) of expert e, at the start of its stick ...
+        # Row c of column s starts this stick; row c + 1 starts the next one.
         assert host_at[first] == e * block + c * free_elems + s * stick
-        # ... and the next row of the same column starts the very next stick.
         if c + 1 < contract:
             assert host_at[first + stick] == host_at[first] + free_elems
