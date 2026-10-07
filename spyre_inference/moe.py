@@ -454,10 +454,12 @@ def _to_spyre_expert_weight(
         moved = dma_moe_expert_weight_to_spyre(weight)
         assert moved is not None
         return moved
+    if not torch.spyre.is_initialized():
+        torch.empty(0, dtype=weight.dtype, device="spyre")
     weight = weight.contiguous()
     layout = _expert_kernel_layout(weight)
     assert weight.shape[-1] % layout.elems_per_stick() == 0, "the free dim must span whole sticks"
-    # Lands on the current Spyre device like the ``dma_*`` helpers, but does not start the runtime.
+    # Lands on the current Spyre device, as the ``dma_*`` helpers do.
     return weight.to(device_layout=layout)  # ty: ignore[no-matching-overload]
 
 
@@ -496,7 +498,7 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     if transform_down is not None:
         w2 = transform_down(w2)
     # Down's free dim (hidden) is too wide for one weight chunk; in the gather layout its rows
-    # would stream in short transfers. Moved last, since this move does not start the runtime.
+    # would stream in short transfers.
     layer.spyre_moe_down = _to_spyre_expert_weight(
         w2.transpose(1, 2), (0, 0, 0, pad), kernel_order=True
     )

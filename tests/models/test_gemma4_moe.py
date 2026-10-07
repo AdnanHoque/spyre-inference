@@ -169,7 +169,6 @@ def moe_weights(request):
         stacks["gate"] = F.pad(stacks["gate"], (0, pad))
         stacks["up"] = F.pad(stacks["up"], (0, pad))
         stacks["down"] = F.pad(stacks["down"], (0, 0, 0, pad))
-    # Production move and order: down last, since its move does not start the runtime.
     device = {
         k: _to_spyre_expert_weight(v, (), kernel_order=k == "down") for k, v in stacks.items()
     }
@@ -704,7 +703,6 @@ def stick_aligned_moe_weights():
         "down": torch.randn(STICK_EXPERTS, INTER, HIDDEN, dtype=torch.float16) * 0.05,
     }
     host["scale"] = torch.ones(STICK_EXPERTS, dtype=torch.float16)
-    # Down last, as in ``_prepare_layer``: its move does not start the runtime.
     device = {
         k: _to_spyre_expert_weight(host[k], (), kernel_order=k == "down")
         for k in ("gate", "up", "down")
