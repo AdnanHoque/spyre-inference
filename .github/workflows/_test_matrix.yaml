@@ -92,8 +92,9 @@ on:
             unit        — all spyre-native tests (per-op + attention +
                           distributed), excludes the heavy upstream-vLLM
                           suites
-            integration — fast per-op unit tests only, the smoke suite
-                          (1 config, single card)
+            integration — the smoke suite, a small attention subset, and
+                          the distributed shards (1- and 2-card jobs); the
+                          upstream-dependency dispatch's default
             regression  — every config (default)
             trunk       — push-to-main CI; same coverage as regression
           Same knob and vocabulary as the sibling repos (torch-spyre,
@@ -548,6 +549,17 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-encoder-attention
+          # Small decoder-attention subset carrying attention coverage into the integration
+          # tier, which the full test-attention-shard-* suite above is excluded from. Hence
+          # integration-only: regression/trunk/unit already run the full shards.
+          - cfg: Spyre attention smoke
+            test_types: integration
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-smoke
           # Distributed (TP=2) suite, sharded across parallel 2-card jobs. Each
           # case spawns a TP=2 subprocess pair, so the model-run cases dominate;
           # the plugin's weighted partition balances by recorded runtime.
