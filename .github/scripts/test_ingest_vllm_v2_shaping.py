@@ -449,3 +449,20 @@ def test_artifact_results_duration_is_zero_without_elapsed_time(mod, monkeypatch
     rows = [_flat(metric="avg_latency", actual=0.42, test_name="latency_a")]
     (result,) = _artifact_write(mod, rows, monkeypatch)["artifact_results"]
     assert result["duration_s"] == 0.0
+
+
+def test_the_leg_artifact_carries_the_ci_tags(mod, monkeypatch):
+    import spyre_clickhouse_ingest as lib
+
+    seen = {}
+
+    def ci_tags(event, repo, branch, sha, pr, day=None):
+        seen.update(event=event, repo=repo, branch=branch, sha=sha, day=day)
+        return [("spyre-inference@abc123def456", "main")]
+
+    monkeypatch.setattr(lib, "ci_tags", ci_tags, raising=False)
+    got = _artifact_write(mod, [_flat()], monkeypatch, ci_event="push", pr_number="0")
+    assert [(t["tag"], t["tag_family"]) for t in got["artifact_tags"]] == [
+        ("spyre-inference@abc123def456", "main")
+    ]
+    assert (seen["event"], seen["branch"], seen["sha"]) == ("push", "main", "abc123def4567890")
