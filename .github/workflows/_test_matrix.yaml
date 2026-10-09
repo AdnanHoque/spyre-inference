@@ -1194,7 +1194,8 @@ jobs:
           echo "benchmarks done"
 
       # A dispatch by SHA names no branch; claim the dispatch ref only when it contains the
-      # commit, rather than recording the SHA as a branch.
+      # commit, rather than recording the SHA as a branch. curl, not `gh`: the runner image has no
+      # gh, and a silent failure here recorded every dispatched run with an empty branch.
       - name: Resolve the tested commit and branch
         id: tested
         if: ${{ !cancelled() && github.event_name != 'pull_request' }}
@@ -1207,7 +1208,10 @@ jobs:
           SHA="$(git rev-parse HEAD)"
           BRANCH="${REF_IN:-${REF_NAME}}"
           if [[ "${BRANCH}" =~ ^[0-9a-f]{7,40}$ ]]; then
-            STATUS="$(gh api "repos/${REPO}/compare/${REF_NAME}...${SHA}" --jq .status 2>/dev/null || true)"
+            STATUS="$(curl -fsS -H "Authorization: Bearer ${GH_TOKEN}" \
+              "${GITHUB_API_URL}/repos/${REPO}/compare/${REF_NAME}...${SHA}?per_page=1" \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin)["status"])' 2>/dev/null)" \
+              || echo "::warning::could not compare ${REF_NAME}...${SHA}; recording no branch"
             case "${STATUS}" in
               identical|behind) BRANCH="${REF_NAME}" ;;
               *) BRANCH="" ;;
