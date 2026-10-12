@@ -839,10 +839,13 @@ def test_traced_persistent_dispatch_matches_dense_reference():
     """
     from spyre_testing_plugin.pytest_plugin import spyre_available
     from torch_spyre._C import get_elem_in_stick
-    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
     from torch_spyre.ops.fallbacks import FallbackWarning
 
-    from spyre_inference.moe import SpyreMoERecipe, SpyreUnquantizedFusedMoEMethod
+    from spyre_inference.moe import (
+        SpyreMoERecipe,
+        SpyreUnquantizedFusedMoEMethod,
+        _to_spyre_expert_weight,
+    )
 
     if not spyre_available():
         pytest.skip("Spyre device not available")
@@ -854,12 +857,14 @@ def test_traced_persistent_dispatch_matches_dense_reference():
         "up": torch.randn(GEMMA4_EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05,
         "down": torch.randn(GEMMA4_EXPERTS, INTER, HIDDEN, dtype=torch.float16) * 0.05,
     }
+    # The layouts ``_prepare_layer`` builds, down in kernel order, as the in-graph kernel reads it.
+    device = {k: _to_spyre_expert_weight(v, (), kernel_order=k == "down") for k, v in host.items()}
     stick = get_elem_in_stick(torch.float16)
     layer = SimpleNamespace(
         spyre_moe_recipe=SpyreMoERecipe("gelu_tanh", "full_softmax"),
-        spyre_moe_gate=dma_moe_expert_weight_to_spyre(host["gate"]),
-        spyre_moe_up=dma_moe_expert_weight_to_spyre(host["up"]),
-        spyre_moe_down=dma_moe_expert_weight_to_spyre(host["down"]),
+        spyre_moe_gate=device["gate"],
+        spyre_moe_up=device["up"],
+        spyre_moe_down=device["down"],
         spyre_moe_stick=stick,
         spyre_moe_route_identity=torch.eye(stick, dtype=torch.float16).to("spyre"),
         top_k=top_k,
