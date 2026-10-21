@@ -130,3 +130,40 @@ def test_inline_forward_still_writes_the_cache_and_skips_the_opaque_op(monkeypat
     layer.impl.do_kv_cache_update.reset_mock()
     attn_layer._spyre_attention_forward(layer, q, k, v, output_shape=torch.Size((t, heads * d)))
     opaque.assert_called_once()
+
+
+def test_fp8_cache_keeps_prefill_opaque(monkeypatch):
+    heads, kv_heads, width, tokens = 8, 2, 128, 16
+    layer = Mock()
+    layer.attn_type = attn_layer.AttentionType.DECODER
+    layer.kv_sharing_target_layer_name = None
+    layer.query_quant = None
+    layer.sliding_window = None
+    layer.num_heads, layer.num_kv_heads = heads, kv_heads
+    layer.head_size = layer.head_size_v = width
+    layer.layer_name = "layers.0.self_attn"
+    layer.kv_cache = [torch.zeros(1)]
+    layer.impl._compile_attn = True
+    layer.impl.kv_cache_fp8 = True
+    layer.impl.alibi_slopes = None
+    layer.impl.logits_soft_cap = 0.0
+    layer.impl.staging_buffers = None
+    layer.impl.do_kv_cache_update.return_value = torch.ones(1)
+
+    holder = attn_layer.install([layer])
+    assert not holder.inline_prefill
+    holder.publish_prefill([tokens], tokens)
+    assert holder.prefill_mask is None
+    holder.slots = torch.arange(tokens)
+
+    opaque = Mock(side_effect=lambda q, k, v, out, *args, **kwargs: out.zero_())
+    monkeypatch.setattr(torch.ops.vllm, "unified_attention_with_output", opaque)
+    query = torch.randn(tokens, heads * width)
+    key = torch.randn(tokens, kv_heads * width)
+    value = torch.randn_like(key)
+    result = layer.forward(query, key, value)
+
+    layer.impl.do_kv_cache_update.assert_called_once()
+    opaque.assert_called_once()
+    assert result.shape == query.shape
+    assert torch.count_nonzero(result) == 0
