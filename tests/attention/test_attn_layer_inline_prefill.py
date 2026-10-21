@@ -167,3 +167,19 @@ def test_fp8_cache_keeps_prefill_opaque(monkeypatch):
     opaque.assert_called_once()
     assert result.shape == query.shape
     assert torch.count_nonzero(result) == 0
+
+
+def test_inline_prefill_requires_a_full_logical_rectangle():
+    holder = _holder()
+    holder.publish_prefill([512], 512)
+    full_prompt_mask = holder.prefill_mask
+    assert full_prompt_mask is not None
+    assert full_prompt_mask.shape == (1, 1, 512, 512)
+
+    holder.publish_prefill([64], 512)
+    assert holder.prefill_mask is None
+    holder.publish_prefill([1], 1)
+    assert holder.prefill_mask is None
+
+    holder.publish_prefill([512], 512)
+    assert holder.prefill_mask is full_prompt_mask

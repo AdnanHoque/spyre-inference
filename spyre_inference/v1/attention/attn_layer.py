@@ -93,6 +93,7 @@ class SlotMapping:
         """
         if (
             query_lens is None
+            or sum(query_lens) != num_tokens
             or not self.inline_prefill
             or not 1 < num_tokens <= INLINE_PREFILL_MAX_TOKENS
             or has_kv_transfer_group()
