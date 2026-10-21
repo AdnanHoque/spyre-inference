@@ -76,15 +76,11 @@ def test_complete_snapshots_precede_every_cache_write():
     key = qkv[:, 1024:1280].view(17, 2, 128)
     value = qkv[:, 1280:].view(17, 2, 128)
     cache = torch.zeros(64, 128, dtype=torch.float16)
-    graph = make_fx(reshape_and_cache_head_major_kernel)(
-        key,
-        value,
-        cache.clone(),
-        cache.clone(),
-        [torch.arange(17), torch.arange(17) + 32],
-        None,
-        None,
-    ).graph
+    graph = make_fx(
+        lambda key, value, k_rows, v_rows, row_index: reshape_and_cache_head_major_kernel(
+            key, value, k_rows, v_rows, row_index
+        )
+    )(key, value, cache.clone(), cache.clone(), [torch.arange(17), torch.arange(17) + 32]).graph
     nodes = list(graph.nodes)
     scatters = [node for node in nodes if node.target == torch.ops.aten.index_copy_.default]
     assert len(scatters) == 4
