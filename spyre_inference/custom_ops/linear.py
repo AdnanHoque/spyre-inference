@@ -43,6 +43,15 @@ logger = init_logger(__name__)
 _PAD_ROWS = 8
 _MAX_PAD_WEIGHT = 200_000_000
 
+# QKV/O and MLP-down projection requests for the local 512-row TP4 geometry.
+# Keys are transposed [K, N] weight shapes; each request needs 32 cores.
+_PREFILL_PROJ_ROWS = 512
+_PREFILL_PROJ_WORK_DIV = {
+    (4096, 1536): (4, 8),
+    (1024, 4096): (4, 8),
+    (3200, 4096): (4, 8),
+}
+
 
 def spyre_linear_t(
     x: torch.Tensor,
@@ -61,7 +70,20 @@ def spyre_linear_t(
     rows = x.shape[0] if pad_rows and x.dim() == 2 else 0
     if 0 < rows < _PAD_ROWS:
         x = F.pad(x, (0, 0, 0, _PAD_ROWS - rows))
-    out = torch.matmul(x, weight_t)
+    split = _PREFILL_PROJ_WORK_DIV.get(tuple(weight_t.shape)) if x.dim() == 2 else None
+    if split is not None and x.shape[0] == _PREFILL_PROJ_ROWS:
+        from torch_spyre._inductor import config as spyre_config
+
+        if spyre_config.sencores < split[0] * split[1]:
+            split = None
+    if split is None or x.shape[0] != _PREFILL_PROJ_ROWS:
+        out = torch.matmul(x, weight_t)
+    else:
+        from torch_spyre._inductor.propagate_hints import spyre_hint
+
+        m, n = f"_untracked_proj_rows_{x.shape[0]}", f"_untracked_proj_cols_{weight_t.shape[1]}"
+        with spyre_hint(named_dims=[m, n], work_div={m: split[0], n: split[1]}):
+            out = torch.matmul(x, weight_t)
     if bias is not None:
         out = out + bias
     if 0 < rows < _PAD_ROWS:
