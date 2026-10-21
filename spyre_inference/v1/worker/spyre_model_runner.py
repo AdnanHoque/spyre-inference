@@ -1089,7 +1089,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     # Compile the variant that a real all-fresh-prompt step selects.
                     self._warming_inline_prefill = True
                     try:
-                        self._dummy_run(size)
+                        for logical_tokens in attn_layer.inline_prefill_warmup_tokens(size):
+                            with attn_layer.inline_prefill_warmup(logical_tokens):
+                                self._dummy_run(size)
                     finally:
                         self._warming_inline_prefill = False
                         attn_layer.clear_prefill_masks()
