@@ -638,7 +638,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
     the dual-buffer device placement pattern.
     """
 
-    # Set only while warmup compiles the fresh-prompt variant, so its dummy publishes a mask.
+    # True only while warmup compiles the fresh-prompt variant.
     _warming_inline_prefill = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -1016,8 +1016,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             for size in sorted(bucket_sizes, reverse=True):
                 _, last_hidden_states = self._dummy_run(size)
                 if attn_layer.warms_inline_prefill(size):
-                    # The fresh-prompt variant traces attention into the block graph
-                    # (attn_layer); a real all-fresh step at this bucket selects it.
+                    # Compile the variant that a real all-fresh-prompt step selects.
                     self._warming_inline_prefill = True
                     try:
                         self._dummy_run(size)

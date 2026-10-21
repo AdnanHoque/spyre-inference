@@ -873,8 +873,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # Padded to match key/value by upstream once forward_includes_kv_cache_update is
         # False, so the traced write keeps one shape per bucket, not one per token count.
         self._slot_mapping.publish(slot_mapping)
-        # Every sequence a fresh prompt: no cached context, so no page is read and the
-        # forward may trace this step's attention in (see attn_layer).
+        # If every sequence is a fresh prompt, no page is read, so the forward can trace
+        # this step's attention into the block graph (see attn_layer).
         fresh_prompts = (
             apply_causal_mask
             and not per_seq_only

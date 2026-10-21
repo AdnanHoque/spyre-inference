@@ -55,12 +55,10 @@ class SlotMapping:
         self._device: torch.device | None = None
         # One tensor, or one per KV head: whatever the impl's KV store indexes by.
         self.slots: torch.Tensor | list[torch.Tensor] | None = None
-        # Set by install() when every layer can take the fresh-prompt path.
         self.inline_prefill = False
-        # This step's [1, 1, T, T] fresh-prompt mask, or None to keep the opaque core.
+        # [1, 1, T, T] mask for an all-fresh-prompt step; None keeps the opaque core.
         self.prefill_mask: torch.Tensor | None = None
-        # The last layout's mask only: one device tensor per holder, however many
-        # distinct batch layouts a serving run sees.
+        # Keep only the last batch layout's mask, so device memory stays at one mask.
         self._prefill_mask_key: tuple | None = None
         self._prefill_mask_dev: torch.Tensor | None = None
 
@@ -91,8 +89,7 @@ class SlotMapping:
     def publish_prefill(self, query_lens: list[int] | None, num_tokens: int) -> None:
         """Publish this step's fresh-prompt mask, or clear it (``query_lens=None``).
 
-        A KV connector hooks the opaque op to save each layer's pages, so its steps
-        keep that op.
+        A KV connector saves pages through the opaque op, so its steps keep that op.
         """
         if (
             query_lens is None
@@ -121,8 +118,7 @@ class SlotMapping:
         self.publish_prefill([num_tokens] if inline_prefill else None, num_tokens)
 
 
-# Fresh-prompt steps up to this many padded tokens trace attention in. The mask and the
-# score tensor grow as T * T; 512 is the only length measured on device.
+# The mask and the score tensor grow as T * T; 512 is the only length checked on device.
 INLINE_PREFILL_MAX_TOKENS = 512
 
 
@@ -159,8 +155,8 @@ def publish_null_slots(num_tokens: int, inline_prefill: bool = False) -> None:
 
     Warmup would otherwise trace a second graph without the KV write, and a dummy run
     after real inference would scatter into whichever step's slots ran last. The
-    fresh-prompt mask clears too, unless ``inline_prefill`` asks for a one-prompt mask
-    so that warmup compiles the variant a fresh-prompt step selects.
+    fresh-prompt mask clears too. ``inline_prefill`` publishes a one-prompt mask
+    instead, so that warmup compiles the variant that a fresh-prompt step selects.
     """
     for holder in _holders:
         holder.publish_null(num_tokens, inline_prefill)
@@ -214,8 +210,8 @@ def _spyre_attention_forward(
         dep = self.impl.do_kv_cache_update(self, key, value, self.kv_cache, slots)
 
     if dep is not None and mask is not None and mask.shape[-1] == query.shape[0]:
-        # Reads this step's own K/V, not the pages, so it needs no ordering after the
-        # scatter; the scatter still lands for later steps to read.
+        # This reads the step's own K and V, not the pages, so it does not wait for the
+        # scatter. The scatter above still writes the cache for later steps.
         from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
             _encoder_rect_kernel,
         )

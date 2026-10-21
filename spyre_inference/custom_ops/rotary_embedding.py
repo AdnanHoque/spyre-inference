@@ -81,9 +81,9 @@ def _rotate_neox_2x2(
             "_untracked_2",
             "_untracked_64",
         ]
-        # This hint uses local geometry, not a tensor-parallel degree: both Q
-        # and K with eight local heads match the 1024-wide case. The compiler
-        # compacts an eligible fused projection view before the broadcast.
+        # The key is local geometry, not the TP degree: Q and K with eight local
+        # heads both match the 1024-wide case. A row-owned view lets the compiler
+        # compact an eligible fused projection view before the broadcast.
         with spyre_hint(named_dims=names, work_div={rows: 32}):
             x_pairs = x.view(num_tokens, -1, 2, inner)
     else:
