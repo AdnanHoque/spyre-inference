@@ -28,7 +28,8 @@ def reshape_and_cache_head_major_kernel(key, value, k_rows, v_rows, row_index):
     from torch_spyre._inductor import config as spyre_config
     from torch_spyre._inductor.propagate_hints import spyre_hint
 
-    # Match the legal index-stick row partition; preserve whole snapshots.
+    # Partition rows on whole 32-row int32 index sticks.
+    # Keep complete snapshots before any per-head scatter.
     index_sticks = key.shape[0] // 32
     row_owners = min(spyre_config.sencores, max(1, index_sticks))
     while row_owners > 1 and index_sticks % row_owners:

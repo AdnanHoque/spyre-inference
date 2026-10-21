@@ -43,8 +43,9 @@ logger = init_logger(__name__)
 _PAD_ROWS = 8
 _MAX_PAD_WEIGHT = 200_000_000
 
-# QKV/O and MLP-down projection requests for the local 512-row TP4 geometry.
-# Keys are transposed [K, N] weight shapes; each request needs 32 cores.
+# Requested (rows, columns) core splits for the QKV, O and MLP-down projections at
+# the local TP4 shape of one 512-row prefill. Keys are transposed [K, N] weight
+# shapes. Each split needs 32 cores; with fewer cores, the planner chooses.
 _PREFILL_PROJ_ROWS = 512
 _PREFILL_PROJ_WORK_DIV = {
     (4096, 1536): (4, 8),
