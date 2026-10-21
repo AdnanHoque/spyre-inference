@@ -77,7 +77,13 @@ def test_complete_snapshots_precede_every_cache_write():
     value = qkv[:, 1280:].view(17, 2, 128)
     cache = torch.zeros(64, 128, dtype=torch.float16)
     graph = make_fx(reshape_and_cache_head_major_kernel)(
-        key, value, cache.clone(), cache.clone(), [torch.arange(17), torch.arange(17) + 32]
+        key,
+        value,
+        cache.clone(),
+        cache.clone(),
+        [torch.arange(17), torch.arange(17) + 32],
+        None,
+        None,
     ).graph
     nodes = list(graph.nodes)
     scatters = [node for node in nodes if node.target == torch.ops.aten.index_copy_.default]
