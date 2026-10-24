@@ -25,10 +25,11 @@ block-causal mask and the forward runs the encoder's rectangle kernel on this st
 K/V inside the block graph. Any other step publishes ``None`` and keeps the opaque core.
 """
 
+import contextlib
 import types
 import weakref
 from collections.abc import Iterable
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.distributed.kv_transfer import has_kv_transfer_group
@@ -39,6 +40,9 @@ from vllm.v1.attention.backend import AttentionType
 
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
+
+if TYPE_CHECKING:
+    from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
 logger = init_logger(__name__)
 
@@ -56,8 +60,10 @@ class SlotMapping:
         # One tensor, or one per KV head: whatever the impl's KV store indexes by.
         self.slots: torch.Tensor | list[torch.Tensor] | None = None
         self.inline_prefill = False
-        # [1, 1, T, T] mask for an all-fresh-prompt step; None keeps the opaque core.
+        # [1, 1, padded Q, declared KV] mask; None keeps the opaque core.
         self.prefill_mask: torch.Tensor | None = None
+        self.prefill_bucketer: SpyreAttnBucketer | None = None
+        self._prefill_warmup_tokens: int | None = None
         # Keep only the last batch layout's mask, so device memory stays at one mask.
         self._prefill_mask_key: tuple | None = None
         self._prefill_mask_dev: torch.Tensor | None = None
@@ -86,25 +92,41 @@ class SlotMapping:
             return
         self.slots = self._write_index(slot_mapping.clamp(min=_NULL_SLOT), device)
 
+    def _prefill_kv_extent(self, logical_tokens: int, num_tokens: int) -> int | None:
+        if logical_tokens == num_tokens:
+            return num_tokens
+        if not 1 < logical_tokens < num_tokens or self.prefill_bucketer is None:
+            return None
+        bucket = self.prefill_bucketer.find_kv_bucket(logical_tokens)
+        if bucket is None or not logical_tokens <= bucket < num_tokens or bucket % 64:
+            return None
+        return bucket
+
     def publish_prefill(self, query_lens: list[int] | None, num_tokens: int) -> None:
         """Publish this step's fresh-prompt mask, or clear it (``query_lens=None``).
 
         A KV connector saves pages through the opaque op, so its steps keep that op.
         """
+        if query_lens is not None and self._prefill_warmup_tokens is not None:
+            query_lens = [self._prefill_warmup_tokens]
+        logical_tokens = sum(query_lens) if query_lens is not None else 0
+        kv_tokens = self._prefill_kv_extent(logical_tokens, num_tokens)
         if (
             query_lens is None
-            or sum(query_lens) != num_tokens
+            or any(n <= 0 for n in query_lens)
+            or not 1 < logical_tokens <= num_tokens <= INLINE_PREFILL_MAX_TOKENS
+            or kv_tokens is None
+            or (logical_tokens != num_tokens and len(query_lens) != 1)
             or not self.inline_prefill
-            or not 1 < num_tokens <= INLINE_PREFILL_MAX_TOKENS
             or has_kv_transfer_group()
             or self._resolve_device() is None
         ):
             self.prefill_mask = None
             return
-        key = (tuple(query_lens), num_tokens)
+        key = (tuple(query_lens), num_tokens, kv_tokens)
         if key != self._prefill_mask_key:
             dtype = self._layers[0].impl.model_dtype  # ty: ignore[possibly-missing-attribute]
-            mask = prefill_block_causal_mask(query_lens, num_tokens, dtype)
+            mask = prefill_block_causal_mask(query_lens, num_tokens, dtype, kv_tokens)
             self._prefill_mask_dev = convert(mask, self._device)
             self._prefill_mask_key = key
         self.prefill_mask = self._prefill_mask_dev
@@ -124,13 +146,36 @@ INLINE_PREFILL_MAX_TOKENS = 512
 
 
 def prefill_block_causal_mask(
-    query_lens: list[int], num_tokens: int, dtype: torch.dtype
+    query_lens: list[int], num_tokens: int, dtype: torch.dtype, kv_tokens: int | None = None
 ) -> torch.Tensor:
-    """Additive ``[1, 1, T, T]`` mask: row r sees key c iff c <= r in r's own sequence.
+    """Additive ``[1, 1, Q, KV]`` mask with sequence-local causal visibility.
 
-    Padded rows (past ``sum(query_lens)``) see only themselves, so no row is fully
-    masked; ``finfo.min / 2`` for the reason given at ``encoder_key_pad_mask``.
+    Square masks retain self-attending padded rows. With compact KV, discarded
+    padded queries attend key zero so no row is fully masked. ``finfo.min / 2``
+    follows ``encoder_key_pad_mask``.
     """
+    if kv_tokens is not None and kv_tokens < num_tokens:
+        logical_tokens = sum(query_lens)
+        if not 1 < logical_tokens <= kv_tokens < num_tokens:
+            raise ValueError("compact KV must cover the complete logical fresh batch")
+        seq = torch.full((kv_tokens,), -1, dtype=torch.int32)
+        start = 0
+        for index, length in enumerate(query_lens):
+            seq[start : start + length] = index
+            start += length
+        q_pos = torch.arange(num_tokens).clamp(max=logical_tokens - 1)
+        k_pos = torch.arange(kv_tokens)
+        # Valid rows keep block causality; discarded query padding needs one
+        # finite source even after its former self-key is outside the prefix.
+        attend = (seq[q_pos, None] == seq[None, :]) & (k_pos[None, :] <= q_pos[:, None])
+        attend &= k_pos[None, :] < logical_tokens
+        attend[logical_tokens:] = False
+        attend[logical_tokens:, 0] = True
+        return (
+            torch.where(attend, 0.0, torch.finfo(dtype).min / 2)
+            .to(dtype)
+            .view(1, 1, num_tokens, kv_tokens)
+        )
     seq = torch.full((num_tokens,), -1, dtype=torch.int32)
     start = 0
     for s, n in enumerate(query_lens):
@@ -172,6 +217,37 @@ def warms_inline_prefill(num_tokens: int) -> bool:
     )
 
 
+def inline_prefill_warmup_tokens(num_tokens: int) -> list[int]:
+    """Representative logical lengths for each group's declared compact KV shapes."""
+    holders = [h for h in _holders if h.inline_prefill]
+    candidates = {num_tokens, 2}
+    for holder in holders:
+        if holder.prefill_bucketer is not None:
+            candidates.update(k + 1 for k in holder.prefill_bucketer.kv_buckets)
+    variants = {}
+    for logical in sorted(candidates, reverse=True):
+        if not 1 < logical <= num_tokens:
+            continue
+        shape = tuple(h._prefill_kv_extent(logical, num_tokens) for h in holders)
+        if all(extent is None for extent in shape):
+            continue
+        variants.setdefault(shape, logical)
+    return list(variants.values())
+
+
+@contextlib.contextmanager
+def inline_prefill_warmup(logical_tokens: int):
+    holders = list(_holders)
+    try:
+        for holder in holders:
+            holder._prefill_warmup_tokens = logical_tokens
+        yield
+    finally:
+        for holder in holders:
+            holder._prefill_warmup_tokens = None
+            holder.prefill_mask = None
+
+
 def clear_prefill_masks() -> None:
     for holder in _holders:
         holder.prefill_mask = None
@@ -210,13 +286,25 @@ def _spyre_attention_forward(
         # invisible because the op reaches its cache through the forward context.
         dep = self.impl.do_kv_cache_update(self, key, value, self.kv_cache, slots)
 
-    if dep is not None and mask is not None and mask.shape[-1] == query.shape[0]:
+    if (
+        dep is not None
+        and mask is not None
+        and key is not None
+        and value is not None
+        and mask.shape[-2] == query.shape[0]
+        and 0 < mask.shape[-1] <= min(key.shape[0], value.shape[0])
+    ):
         # This reads the step's own K and V, not the pages, so it does not wait for the
         # scatter. The scatter above still writes the cache for later steps.
         from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
             _encoder_rect_kernel,
         )
 
+        kv_tokens = mask.shape[-1]
+        if kv_tokens < key.shape[0]:
+            key = key[:kv_tokens]
+        if kv_tokens < value.shape[0]:
+            value = value[:kv_tokens]
         attn = _encoder_rect_kernel(
             query,
             key,
@@ -224,10 +312,11 @@ def _spyre_attention_forward(
             mask,
             self.impl.scale,
             1,
-            mask.shape[-1],
+            query.shape[0],
             self.num_heads,
             self.num_kv_heads,
             self.head_size,
+            kv_extent=kv_tokens,
         )
         return attn.reshape(-1, hidden_size)
 

@@ -183,3 +183,145 @@ def test_inline_prefill_requires_a_full_logical_rectangle():
 
     holder.publish_prefill([512], 512)
     assert holder.prefill_mask is full_prompt_mask
+
+
+def _compact_holder(kv_buckets=(128, 256, 512)):
+    from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
+
+    holder = _holder()
+    bucketer = object.__new__(SpyreAttnBucketer)
+    bucketer._kv_buckets = list(kv_buckets)
+    holder.prefill_bucketer = bucketer
+    return holder
+
+
+@pytest.mark.parametrize("logical,kv_tokens", [(64, 128), (128, 128), (129, 256)])
+def test_compact_single_prompt_mask_matches_causal_gqa(logical, kv_tokens):
+    holder = _compact_holder()
+    holder.publish_prefill([logical], 512)
+    assert holder.prefill_mask is not None
+    assert holder.prefill_mask.shape == (1, 1, 512, kv_tokens)
+    mask = attn_layer.prefill_block_causal_mask([logical], 512, torch.float32, kv_tokens)
+    assert torch.all(mask[..., logical:] < 0)
+    assert torch.all(mask[..., logical:, 0] == 0)
+    assert torch.all(mask[..., logical:, 1:] < 0)
+    assert torch.all((mask == 0).any(-1))
+    torch.manual_seed(121)
+    q = torch.randn(512, 8, 128)
+    k, v = torch.randn(512, 2, 128), torch.randn(512, 2, 128)
+    got = _encoder_rect_kernel(
+        q,
+        k[:kv_tokens],
+        v[:kv_tokens],
+        mask,
+        128**-0.5,
+        1,
+        512,
+        8,
+        2,
+        128,
+        kv_extent=kv_tokens,
+    )
+    want = F.scaled_dot_product_attention(
+        q[:logical].transpose(0, 1),
+        k[:logical].transpose(0, 1),
+        v[:logical].transpose(0, 1),
+        is_causal=True,
+        enable_gqa=True,
+    ).transpose(0, 1)
+    torch.testing.assert_close(got[:logical], want, rtol=1e-5, atol=1e-5)
+    full_mask = attn_layer.prefill_block_causal_mask([logical], 512, torch.float32)
+    full = _encoder_rect_kernel(q, k, v, full_mask, 128**-0.5, 1, 512, 8, 2, 128)
+    torch.testing.assert_close(got[:logical], full[:logical], rtol=1e-5, atol=1e-5)
+    expected_padding = v[0].repeat_interleave(4, 0).expand(512 - logical, -1, -1)
+    torch.testing.assert_close(got[logical:], expected_padding, rtol=1e-5, atol=1e-5)
+    assert torch.isfinite(got).all()
+    assert got.shape == q.shape
+
+
+def test_compact_prefill_keeps_unsupported_layouts_opaque():
+    holder = _compact_holder()
+    for lengths, rows in [([32, 32], 512), ([1], 512), ([300], 512), ([513], 512)]:
+        holder.publish_prefill(lengths, rows)
+        assert holder.prefill_mask is None
+    holder = _compact_holder((256, 512))
+    holder.publish_prefill([64], 512)
+    assert holder.prefill_mask.shape == (1, 1, 512, 256)
+    holder = _compact_holder((512,))
+    holder.publish_prefill([64], 512)
+    assert holder.prefill_mask is None
+    holder.publish_prefill([512], 512)
+    assert holder.prefill_mask.shape == (1, 1, 512, 512)
+
+
+def test_compact_forward_writes_full_cache_before_bounding_operands(monkeypatch):
+    import spyre_inference.v1.attention.backends.spyre_encoder_attn as encoder
+
+    holder = _compact_holder()
+    holder.publish_prefill([64], 512)
+    holder.slots = torch.arange(512)
+    layer = Mock()
+    layer.num_heads, layer.num_kv_heads = 8, 2
+    layer.head_size = layer.head_size_v = 128
+    layer.layer_name = "compact.test"
+    layer.impl.scale = 128**-0.5
+    layer.impl.staging_buffers = None
+    layer.spyre_slots = holder
+    events = []
+
+    def update(_layer, key, value, _cache, slots):
+        assert key.shape == value.shape == (512, 2, 128)
+        assert slots.shape == (512,)
+        events.append("cache")
+        return torch.ones(1)
+
+    def rectangle(query, key, value, mask, *args, kv_extent=None):
+        assert events == ["cache"]
+        assert query.shape == (512, 8, 128)
+        assert key.shape == value.shape == (128, 2, 128)
+        assert mask.shape == (1, 1, 512, 128)
+        assert kv_extent == 128
+        assert key.data_ptr() == original_key.data_ptr()
+        assert value.data_ptr() == original_value.data_ptr()
+        events.append("attention")
+        return torch.zeros_like(query)
+
+    layer.impl.do_kv_cache_update.side_effect = update
+    monkeypatch.setattr(encoder, "_encoder_rect_kernel", rectangle)
+    opaque = Mock()
+    monkeypatch.setattr(torch.ops.vllm, "unified_attention_with_output", opaque)
+    query = torch.randn(512, 1024)
+    original_key, original_value = torch.randn(512, 256), torch.randn(512, 256)
+    saved = [x.clone() for x in (query, original_key, original_value)]
+    result = attn_layer._spyre_attention_forward(layer, query, original_key, original_value)
+    assert events == ["cache", "attention"]
+    assert result.shape == query.shape
+    assert all(torch.equal(x, y) for x, y in zip((query, original_key, original_value), saved))
+    opaque.assert_not_called()
+
+
+def test_compact_warmup_covers_group_bucket_pairs_and_clears_on_error():
+    holders = [_compact_holder((128, 256, 512)), _compact_holder((256, 512))]
+    previous = list(attn_layer._holders)
+    attn_layer._holders.clear()
+    attn_layer._holders.update(holders)
+    try:
+        variants = attn_layer.inline_prefill_warmup_tokens(512)
+        assert variants[0] == 512
+        reachable = {
+            tuple(h._prefill_kv_extent(n, 512) for h in holders) for n in range(2, 513)
+        } - {(None, None)}
+        warmed = {tuple(h._prefill_kv_extent(n, 512) for h in holders) for n in variants}
+        assert warmed == reachable
+        with (
+            pytest.raises(RuntimeError, match="warmup failure"),
+            attn_layer.inline_prefill_warmup(2),
+        ):
+            for holder in holders:
+                holder.publish_null(512, inline_prefill=True)
+                assert holder.prefill_mask.shape[-1] in (128, 256)
+            raise RuntimeError("warmup failure")
+        assert all(h._prefill_warmup_tokens is None and h.prefill_mask is None for h in holders)
+    finally:
+        attn_layer._holders.clear()
+        attn_layer._holders.update(previous)
