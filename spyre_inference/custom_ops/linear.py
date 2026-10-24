@@ -36,22 +36,32 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 
+from spyre_inference import envs
+
 logger = init_logger(__name__)
 
 # torch-spyre#4032: on some weight shapes a short row block runs well below the rate a
 # full 8 PT rows sustain. It costs a few percent elsewhere, so re-measure before widening.
 _PAD_ROWS = 8
 _MAX_PAD_WEIGHT = 200_000_000
+_TRANSPOSE_BLOCK_ROWS = 128
 
-# Requested (rows, columns) core splits for the QKV, O and MLP-down projections at
-# the local TP4 shape of one 512-row prefill. Keys are transposed [K, N] weight
-# shapes. Each split needs 32 cores; with fewer cores, the planner chooses.
-_PREFILL_PROJ_ROWS = 512
-_PREFILL_PROJ_WORK_DIV = {
-    (4096, 1536): (4, 8),
-    (1024, 4096): (4, 8),
-    (3200, 4096): (4, 8),
-}
+
+def _transpose_contiguous(w: torch.Tensor) -> torch.Tensor:
+    """`w.t().contiguous()`, bit-identical. PyTorch copies a 2-D transpose on one thread;
+    with SPYRE_BLOCKED_TRANSPOSE a 2-D CPU `w` is copied 128 source rows at a time, which
+    runs on torch's CPU threads and keeps each block's reads and writes in cache."""
+    if not (
+        envs.SPYRE_BLOCKED_TRANSPOSE
+        and w.dim() == 2
+        and w.device.type == "cpu"
+        and not w.t().is_contiguous()
+    ):
+        return w.t().contiguous()
+    out = torch.empty((w.shape[1], w.shape[0]), dtype=w.dtype, device=w.device)
+    for i in range(0, w.shape[0], _TRANSPOSE_BLOCK_ROWS):
+        out[:, i : i + _TRANSPOSE_BLOCK_ROWS].copy_(w[i : i + _TRANSPOSE_BLOCK_ROWS].t())
+    return out
 
 
 def spyre_linear_t(
@@ -71,20 +81,7 @@ def spyre_linear_t(
     rows = x.shape[0] if pad_rows and x.dim() == 2 else 0
     if 0 < rows < _PAD_ROWS:
         x = F.pad(x, (0, 0, 0, _PAD_ROWS - rows))
-    split = _PREFILL_PROJ_WORK_DIV.get(tuple(weight_t.shape)) if x.dim() == 2 else None
-    if split is not None and x.shape[0] == _PREFILL_PROJ_ROWS:
-        from torch_spyre._inductor import config as spyre_config
-
-        if spyre_config.sencores < split[0] * split[1]:
-            split = None
-    if split is None or x.shape[0] != _PREFILL_PROJ_ROWS:
-        out = torch.matmul(x, weight_t)
-    else:
-        from torch_spyre._inductor.propagate_hints import spyre_hint
-
-        m, n = f"_untracked_proj_rows_{x.shape[0]}", f"_untracked_proj_cols_{weight_t.shape[1]}"
-        with spyre_hint(named_dims=[m, n], work_div={m: split[0], n: split[1]}):
-            out = torch.matmul(x, weight_t)
+    out = torch.matmul(x, weight_t)
     if bias is not None:
         out = out + bias
     if 0 < rows < _PAD_ROWS:
@@ -131,9 +128,10 @@ class SpyreTransposedWeightMethod:
             w = padded
 
         # Store transposed (`[in, out]`, contiguous) so the forward GEMM is the
-        # Spyre-fast `x @ A`. `.t().contiguous()` gives INDEPENDENT storage, so a
-        # distinct WEIGHT_T_ATTR leaves the source `weight` untouched.
-        setattr(layer, self.WEIGHT_T_ATTR, Parameter(w.t().contiguous(), requires_grad=False))
+        # Spyre-fast `x @ A`. The transpose is a copy unless `w.t()` is already
+        # contiguous (a single row, or a transposed view). Loaded weights never are,
+        # so a distinct WEIGHT_T_ATTR leaves the source `weight` untouched.
+        setattr(layer, self.WEIGHT_T_ATTR, Parameter(_transpose_contiguous(w), requires_grad=False))
 
     def _pad_short_rows(self, layer: torch.nn.Module) -> bool:
         return False
