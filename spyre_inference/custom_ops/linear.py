@@ -36,12 +36,15 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 
+from spyre_inference import envs
+
 logger = init_logger(__name__)
 
 # torch-spyre#4032: on some weight shapes a short row block runs well below the rate a
 # full 8 PT rows sustain. It costs a few percent elsewhere, so re-measure before widening.
 _PAD_ROWS = 8
 _MAX_PAD_WEIGHT = 200_000_000
+_TRANSPOSE_BLOCK_ROWS = 128
 
 # Requested (rows, columns) core splits for the QKV, O and MLP-down projections at
 # the local TP4 shape of one 512-row prefill. Keys are transposed [K, N] weight
@@ -52,6 +55,23 @@ _PREFILL_PROJ_WORK_DIV = {
     (1024, 4096): (4, 8),
     (3200, 4096): (4, 8),
 }
+
+
+def _transpose_contiguous(w: torch.Tensor) -> torch.Tensor:
+    """`w.t().contiguous()`, bit-identical. PyTorch copies a 2-D transpose on one thread;
+    with SPYRE_BLOCKED_TRANSPOSE a 2-D CPU `w` is copied 128 source rows at a time, which
+    runs on torch's CPU threads and keeps each block's reads and writes in cache."""
+    if not (
+        envs.SPYRE_BLOCKED_TRANSPOSE
+        and w.dim() == 2
+        and w.device.type == "cpu"
+        and not w.t().is_contiguous()
+    ):
+        return w.t().contiguous()
+    out = torch.empty((w.shape[1], w.shape[0]), dtype=w.dtype, device=w.device)
+    for i in range(0, w.shape[0], _TRANSPOSE_BLOCK_ROWS):
+        out[:, i : i + _TRANSPOSE_BLOCK_ROWS].copy_(w[i : i + _TRANSPOSE_BLOCK_ROWS].t())
+    return out
 
 
 def spyre_linear_t(
@@ -131,9 +151,10 @@ class SpyreTransposedWeightMethod:
             w = padded
 
         # Store transposed (`[in, out]`, contiguous) so the forward GEMM is the
-        # Spyre-fast `x @ A`. `.t().contiguous()` gives INDEPENDENT storage, so a
-        # distinct WEIGHT_T_ATTR leaves the source `weight` untouched.
-        setattr(layer, self.WEIGHT_T_ATTR, Parameter(w.t().contiguous(), requires_grad=False))
+        # Spyre-fast `x @ A`. The transpose is a copy unless `w.t()` is already
+        # contiguous (a single row, or a transposed view). Loaded weights never are,
+        # so a distinct WEIGHT_T_ATTR leaves the source `weight` untouched.
+        setattr(layer, self.WEIGHT_T_ATTR, Parameter(_transpose_contiguous(w), requires_grad=False))
 
     def _pad_short_rows(self, layer: torch.nn.Module) -> bool:
         return False
