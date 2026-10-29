@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_KV_LAYOUT: str = "head_major"
     SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_BATCHED_DECODE: bool = True
+    SPYRE_JAGGED_DECODE: bool = True
     SPYRE_BLOCKED_TRANSPOSE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_LOGITS_CPU_GATHER: bool = False
@@ -116,6 +117,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # head-major cache, which uses a split page index, so a token-major run keeps
     # the per-seq loop whatever this is set to.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
+    # When "1" (default), a decode batch spanning several KV buckets runs one batched
+    # dispatch per bucket group instead of padding every sequence to the longest.
+    "SPYRE_JAGGED_DECODE": lambda: bool(int(os.getenv("SPYRE_JAGGED_DECODE", "1"))),
     # When "1" (default), build each linear layer's transposed weight on the host in
     # blocks of source rows. A plain `w.t().contiguous()` copies on one thread; the
     # blocked copy runs on torch's CPU threads and cuts model load time. Bit-identical.
