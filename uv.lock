@@ -5513,6 +5513,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "coverage" },
+    { name = "pandas", marker = "platform_machine == 's390x'" },
     { name = "spyre-testing-plugin" },
 ]
 
@@ -5530,6 +5531,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "coverage" },
+    { name = "pandas", marker = "platform_machine == 's390x'", specifier = "!=3.1.0" },
     { name = "spyre-testing-plugin", editable = "tests/plugin" },
 ]
 

@@ -405,4 +405,6 @@ plugins.md007.indent = 4
 dev = [
     "spyre-testing-plugin",
     "coverage",
+    # pandas 3.1.0 fails to build from source on s390x (pandas-dev/pandas#71548)
+    "pandas!=3.1.0; platform_machine == 's390x'",
 ]
