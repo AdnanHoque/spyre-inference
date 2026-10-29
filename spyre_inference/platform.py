@@ -236,6 +236,28 @@ class TorchSpyrePlatform(CpuPlatform):
         pass
 
     @classmethod
+    def register_triton_kernel_overrides(cls) -> None:
+        from vllm.triton_utils.dispatcher import register_kernels
+
+        from spyre_inference.v1.spec_decode import rejection_sampler
+
+        # Use our vendored C++ kernels; CpuPlatform's wrappers require the absent vllm._C.
+        register_kernels(
+            {
+                "vllm.v1.sample.rejection_sampler.rejection_greedy_sample_kernel": (
+                    rejection_sampler.greedy_sample
+                ),
+                "vllm.v1.sample.rejection_sampler.rejection_random_sample_kernel": (
+                    rejection_sampler.random_sample
+                ),
+                "vllm.v1.sample.rejection_sampler.expand_kernel": rejection_sampler.expand,
+                "vllm.v1.sample.rejection_sampler.sample_recovered_tokens_kernel": (
+                    rejection_sampler.recover
+                ),
+            }
+        )
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return "torch-spyre"
 
