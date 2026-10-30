@@ -46,16 +46,6 @@ _PAD_ROWS = 8
 _MAX_PAD_WEIGHT = 200_000_000
 _TRANSPOSE_BLOCK_ROWS = 128
 
-# Requested (rows, columns) core splits for the QKV, O and MLP-down projections at
-# the local TP4 shape of one 512-row prefill. Keys are transposed [K, N] weight
-# shapes. Each split needs 32 cores; with fewer cores, the planner chooses.
-_PREFILL_PROJ_ROWS = 512
-_PREFILL_PROJ_WORK_DIV = {
-    (4096, 1536): (4, 8),
-    (1024, 4096): (4, 8),
-    (3200, 4096): (4, 8),
-}
-
 
 def _transpose_contiguous(w: torch.Tensor) -> torch.Tensor:
     """`w.t().contiguous()`, bit-identical. PyTorch copies a 2-D transpose on one thread;
@@ -79,6 +69,7 @@ def spyre_linear_t(
     weight_t: torch.Tensor,
     bias: torch.Tensor | None,
     pad_rows: bool = False,
+    work_div: dict[int, tuple[int, int]] | None = None,
 ):
     """Linear forward with a pre-transposed weight: `x @ Wᵀ (+ bias)`.
 
@@ -91,13 +82,8 @@ def spyre_linear_t(
     rows = x.shape[0] if pad_rows and x.dim() == 2 else 0
     if 0 < rows < _PAD_ROWS:
         x = F.pad(x, (0, 0, 0, _PAD_ROWS - rows))
-    split = _PREFILL_PROJ_WORK_DIV.get(tuple(weight_t.shape)) if x.dim() == 2 else None
-    if split is not None and x.shape[0] == _PREFILL_PROJ_ROWS:
-        from torch_spyre._inductor import config as spyre_config
-
-        if spyre_config.sencores < split[0] * split[1]:
-            split = None
-    if split is None or x.shape[0] != _PREFILL_PROJ_ROWS:
+    split = work_div.get(x.shape[0]) if work_div and x.dim() == 2 else None
+    if split is None:
         out = torch.matmul(x, weight_t)
     else:
         from torch_spyre._inductor.propagate_hints import spyre_hint
@@ -170,6 +156,7 @@ class SpyreTransposedWeightMethod:
             getattr(layer, self.WEIGHT_T_ATTR),
             bias,
             pad_rows=self._pad_short_rows(layer),
+            work_div=getattr(layer, "spyre_work_div", None),
         )
         padding = cast(int, layer.spyre_row_padding)
         if padding:

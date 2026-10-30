@@ -728,6 +728,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             vllm_config=self.vllm_config, model_config=self.model_config
         )
         check_spyre_model(self.model, get_model_architecture(self.model_config)[1])
+        from spyre_inference.config.kernel_hints import configure_kernel_hints
+
+        configure_kernel_hints(self.model, self.vllm_config)
         self.model_memory_usage = 0  # No GPU memory profiling for Spyre
 
         # Cases appearing in GPUModelRunner.

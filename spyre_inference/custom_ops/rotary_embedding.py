@@ -60,6 +60,7 @@ def _rotate_neox_2x2(
     x: torch.Tensor,
     rot: torch.Tensor,
     head_size: int,
+    work_div: dict[int, int] | None = None,
 ) -> torch.Tensor:
     """Apply full neox RoPE via per-token 2x2 rotation matrices.
 
@@ -70,7 +71,8 @@ def _rotate_neox_2x2(
     """
     num_tokens = x.shape[0]
     inner = head_size // 2
-    if num_tokens == 512 and head_size == 128 and x.numel() // num_tokens in (256, 1024):
+    row_owners = work_div.get(num_tokens) if work_div else None
+    if row_owners is not None:
         from torch_spyre._inductor.propagate_hints import spyre_hint
 
         rows = f"_untracked_rope_rows_{num_tokens}"
@@ -79,12 +81,9 @@ def _rotate_neox_2x2(
             rows,
             f"_untracked_rope_heads_{heads}",
             "_untracked_2",
-            "_untracked_64",
+            f"_untracked_rope_inner_{inner}",
         ]
-        # The key is local geometry, not the TP degree: Q and K with eight local
-        # heads both match the 1024-wide case. A row-owned view lets the compiler
-        # compact an eligible fused projection view before the broadcast.
-        with spyre_hint(named_dims=names, work_div={rows: 32}):
+        with spyre_hint(named_dims=names, work_div={rows: row_owners}):
             x_pairs = x.view(num_tokens, -1, 2, inner)
     else:
         x_pairs = x.view(num_tokens, -1, 2, inner)
@@ -213,8 +212,9 @@ class _SpyreRotaryMixin:
             )
             return out_query, out_key
         rot = cache.index_select(0, positions.flatten()).view(-1, 2, 2, self._padded_inner)
-        out_query = _rotate_neox_2x2(query, rot, self.head_size)
-        out_key = _rotate_neox_2x2(key, rot, self.head_size) if key is not None else None
+        work_div = getattr(self, "spyre_work_div", None)
+        out_query = _rotate_neox_2x2(query, rot, self.head_size, work_div)
+        out_key = _rotate_neox_2x2(key, rot, self.head_size, work_div) if key is not None else None
         return out_query, out_key
 
 

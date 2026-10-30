@@ -62,6 +62,7 @@ def reshape_and_cache_head_major_kernel(
             key = key * 1.0
             value = value * 1.0
     else:
+        # Quantization also materializes the source before the cache write.
         key = quantize_kv(key, k_scale, k_rows.dtype)
         value = quantize_kv(value, v_scale, v_rows.dtype)
     for h, idx in enumerate(row_index):
