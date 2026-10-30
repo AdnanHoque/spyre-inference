@@ -204,3 +204,50 @@ def test_row_hints_do_not_depend_on_serving_context_length(monkeypatch, length):
     model = _Model()
     configure_kernel_hints(model, config)
     assert model.down_proj.spyre_work_div == {512: (4, 8)}
+
+
+def test_context_entries_cannot_silently_select_different_hints(monkeypatch):
+    from spyre_inference.config import DeviceConfig, ModelEntry, ServingConfig
+
+    entry = ModelEntry(
+        "test/model",
+        None,
+        [
+            ServingConfig(4, 1024, 1, DeviceConfig(kernel_hints={"rope": {512: 32}})),
+            ServingConfig(4, 32768, 1, DeviceConfig(kernel_hints={"rope": {512: 16}})),
+        ],
+    )
+    monkeypatch.setattr(model_config, "model_registry", lambda: {"test/model": entry})
+    with pytest.raises(ValueError, match="agree across context lengths"):
+        configure_kernel_hints(_Model(), _config("test/model"))
+
+
+def test_loader_attaches_hints_before_device_transfer():
+    import ast
+    from pathlib import Path
+
+    source = Path(__file__).parents[1] / "spyre_inference/v1/worker/spyre_model_runner.py"
+    tree = ast.parse(source.read_text())
+    loader = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "load_model"
+    )
+    calls = [node for node in ast.walk(loader) if isinstance(node, ast.Call)]
+    hints = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "configure_kernel_hints"
+    ]
+    assert len(hints) == 1
+    load = next(
+        node
+        for node in calls
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "load_model"
+    )
+    move = next(
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "move_model_to_spyre"
+    )
+    assert load.lineno < hints[0].lineno < move.lineno
