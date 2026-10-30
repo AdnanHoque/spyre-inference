@@ -206,14 +206,15 @@ def test_row_hints_do_not_depend_on_serving_context_length(monkeypatch, length):
     assert model.down_proj.spyre_work_div == {512: (4, 8)}
 
 
-def test_context_entries_cannot_silently_select_different_hints(monkeypatch):
+@pytest.mark.parametrize("first", [{"rope": {512: 32}}, {}])
+def test_context_entries_cannot_silently_select_different_hints(monkeypatch, first):
     from spyre_inference.config import DeviceConfig, ModelEntry, ServingConfig
 
     entry = ModelEntry(
         "test/model",
         None,
         [
-            ServingConfig(4, 1024, 1, DeviceConfig(kernel_hints={"rope": {512: 32}})),
+            ServingConfig(4, 1024, 1, DeviceConfig(kernel_hints=first)),
             ServingConfig(4, 32768, 1, DeviceConfig(kernel_hints={"rope": {512: 16}})),
         ],
     )
@@ -250,4 +251,17 @@ def test_loader_attaches_hints_before_device_transfer():
         for node in calls
         if isinstance(node.func, ast.Name) and node.func.id == "move_model_to_spyre"
     )
-    assert load.lineno < hints[0].lineno < move.lineno
+    fix = next(
+        node
+        for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "fix_padded_model"
+    )
+    assert load.lineno < fix.lineno < hints[0].lineno < move.lineno
+
+
+def test_kernel_hints_refuse_unsupported_host_platform(monkeypatch):
+    monkeypatch.setattr(model_config, "current_platform", lambda: "unsupported-host")
+    model = _Model()
+    configure_kernel_hints(model, _config())
+    assert not hasattr(model.down_proj, "spyre_work_div")
+    assert not hasattr(model.rotary_emb, "spyre_work_div")

@@ -48,10 +48,12 @@ def configure_kernel_hints(model, vllm_config):
         return
     tp_size = vllm_config.parallel_config.tensor_parallel_size
     tables = [c.device_config.kernel_hints for c in entry.serving_configs if c.tp_size == tp_size]
-    if not tables or not tables[0]:
+    if not tables:
         return
     if any(table != tables[0] for table in tables[1:]):
         raise ValueError("Kernel hints must agree across context lengths for one model and TP size")
+    if not tables[0]:
+        return
 
     from torch_spyre._inductor import config as spyre_config
 
